@@ -125,8 +125,7 @@ def _tx_frame(n=400, seed=1):
         "auth_code": r.choice(["123456", "12", None], n),
         "is_installment_financed": r.choice([True, False], n),
         "merchant_geo_id": r.choice(["G1", None], n),
-        "mcc": r.choice(["5411", "5812", None], n),
-        "category": r.choice(["grocery", "dining", None], n),
+        "mcc": r.choice(["5411", "5812"], n), "category": r.choice(["grocery", "dining"], n),
         "merchant_name": "n", "is_international": r.choice([True, False], n),
         "channel_group": r.choice(["POS", "ECOM"], n),
         "original_transaction_id": r.choice(["T1", "TZ", None], n),
@@ -144,16 +143,46 @@ def _small_dims(df):
                                       "churn_date": [pd.NaT, d("2026-02-15"), pd.NaT]}),
         "dim_merchant": pd.DataFrame({"merchant_id": ["M1", "M2"], "mcc": ["5411", "5999"],
                                       "category": ["grocery", "dining"], "merchant_name": "n",
-                                      "geo_id": ["G1", None], "country_code": ["US", None]}),
+                                      "geo_id": ["G1", "G1"], "country_code": ["US", "GB"]}),
         "dim_card": pd.DataFrame({"card_id": ["K1", "K2"], "expiry_year": [2026, 2027],
                                   "expiry_month": [2, 1], "issue_date": [d("2026-01-10")] * 2,
                                   "replaced_date": [pd.NaT, d("2026-03-01")]}),
     }
 
 
-def test_tx_metrics_match_pandas_reference():
-    tx = _tx_frame()
-    dims = _small_dims(tx)
+def _null_case():
+    """Original fixture plus appended null-bearing rows / merchant M3 (baseline untouched)."""
+    tx, dims = _tx_frame(), _small_dims(None)
+    extra = tx.iloc[:6].copy()
+    extra["transaction_id"] = [f"TN{i}" for i in range(6)]
+    extra["merchant_id"] = ["M3", "M3", "M3", "M1", "M2", None]
+    extra["merchant_geo_id"] = [None, "G1", None, None, None, None]   # null/null with M3
+    extra["mcc"] = [None, None, "5411", None, "5812", None]
+    extra["category"] = [None, "grocery", None, None, "dining", None]
+    extra["is_international"] = [True, False, True, False, True, False]
+    dims["dim_merchant"] = pd.concat([dims["dim_merchant"], pd.DataFrame({
+        "merchant_id": ["M3"], "mcc": [None], "category": [None], "merchant_name": ["n"],
+        "geo_id": [None], "country_code": [None]})], ignore_index=True)
+    return pd.concat([tx, extra], ignore_index=True), dims
+
+
+def test_tx_metrics_match_pandas_reference_original_fixture():
+    ref_bad = _assert_metrics_match(_tx_frame(), _small_dims(None))
+    assert ref_bad["bad_geo"] == 270  # committed baseline: fixture must not drift
+
+
+def test_tx_metrics_match_pandas_reference_with_null_rows():
+    tx, dims = _null_case()
+    ref_bad = _assert_metrics_match(tx, dims)
+    assert all(v > 0 for v in ref_bad.values())
+    # null/null geo pairs are mismatches under pandas `!=`; they must be counted
+    mm = tx.merge(dims["dim_merchant"][["merchant_id", "geo_id"]], on="merchant_id", how="left")
+    assert ref_bad["bad_geo"] > int(((mm.merchant_geo_id != mm.geo_id)
+                                     & mm.merchant_geo_id.notna() & mm.geo_id.notna()).sum())
+    assert int((mm.merchant_geo_id.isna() & mm.geo_id.isna()).sum()) > 0
+
+
+def _assert_metrics_match(tx, dims):
     stmt = pd.DataFrame({"statement_id": ["S1", "S2", "S3"]})
     facts = {"fact_statement": stmt,
              "fact_installment_plan": pd.DataFrame({"transaction_id": ["T1", "T_missing"]}),
@@ -199,7 +228,7 @@ def test_tx_metrics_match_pandas_reference():
     am = tx[["transaction_date", "account_id"]].merge(dims["dim_account"][["account_id", "closed_date"]], on="account_id", how="left")
     assert M["after_close"] == int((am.closed_date.notna() & (am.transaction_date > am.closed_date)).sum())
     assert M["fk_customer"] == int((~tx.customer_id.isin({"C1", "C2", "C3"})).sum())
-    assert M["fk_merchant"] == int((~tx.merchant_id.isin({"M1", "M2"})).sum())  # nulls are orphans
+    assert M["fk_merchant"] == int((~tx.merchant_id.isin(set(dims["dim_merchant"].merchant_id))).sum())
     assert M["null_geo"] == int(tx.merchant_geo_id.isna().sum())
     assert M["approved"] == int((tx.status == "APPROVED").sum())
     assert M["purchases"] == int((tx.transaction_type == "PURCHASE").sum())
@@ -220,15 +249,13 @@ def test_tx_metrics_match_pandas_reference():
         "bad_geo": int((mm.merchant_geo_id != mm.geo_id).sum()),
         "bad_intl": int((mm.is_international != (mm.country_code != "US")).sum()),
     }
-    assert all(v > 0 for v in ref_bad.values())  # fixture really exercises nulls
-    assert ref_bad["bad_geo"] > int(((mm.merchant_geo_id != mm.geo_id)
-                                     & mm.merchant_geo_id.notna() & mm.geo_id.notna()).sum())
     assert {k: M[k] for k in ref_bad} == ref_bad
     monthly = tx.assign(m=tx.transaction_date.dt.strftime("%Y-%m")).groupby("m").agg(
         n=("transaction_id", "size"), spend=("amount_usd", lambda s: s.clip(lower=0).sum()))
     pd.testing.assert_frame_equal(M["monthly"], monthly, check_dtype=False)
     net = app.groupby("network").agg(n=("transaction_id", "size"), spend=("amount_usd", "sum"))
     pd.testing.assert_frame_equal(M["net_tx"].sort_index(), net.sort_index(), check_dtype=False)
+    return ref_bad
 
 
 # --------------------------------------------------------------------------
