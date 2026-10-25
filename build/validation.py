@@ -84,6 +84,10 @@ def check_fraud_loss_band(fraud: pd.DataFrame, tx: pd.DataFrame):
     """Net fraud loss must sit in the 3-12 bps band of approved purchase spend."""
     spend = float(tx.loc[(tx.status == "APPROVED")
                          & (tx.transaction_type == "PURCHASE"), "amount_usd"].sum())
+    return check_fraud_loss_band_spend(fraud, spend)
+
+
+def check_fraud_loss_band_spend(fraud: pd.DataFrame, spend: float):
     loss = float(fraud.net_loss.sum()) if not fraud.empty else 0.0
     bps = (loss / spend) if spend > 0 else 0.0
     ok = 0.0003 <= bps <= 0.0012
@@ -106,6 +110,12 @@ def check_accepted_limitations(doc_dir):
     ok = "auth_code" in text and "accepted limitation" in text.lower()
     return ok, ("accepted-limitation entry present" if ok else
                 "accepted_limitations.md does not record auth_code")
+
+
+def _rq(M: dict, q: float):
+    """Rounded positive-amount quantile from the Polars metrics (as ``_pct``)."""
+    v = M.get(f"q{q}")
+    return None if v is None else round(float(v), 2)
 
 
 def _pct(series, q):
@@ -207,9 +217,165 @@ def source_percentiles() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# --------------------------------------------------------------------------
+# Transaction-fact metrics (Polars, lazy): fact_transaction is never
+# materialised in pandas. Each value mirrors the former pandas expression.
+# --------------------------------------------------------------------------
+def _small(df: pd.DataFrame, cols: list[str], dates: tuple[str, ...] = ()) -> pl.LazyFrame:
+    out = pl.from_pandas(df[cols].reset_index(drop=True)).lazy()
+    return out.with_columns([pl.col(c).cast(pl.Datetime("ns")) for c in dates])
+
+
+def _not_in(col: str, parent: pd.Series) -> pl.Expr:
+    """1 where ``col`` is not in ``parent`` (null counts as not in, like ``~isin``)."""
+    vals = pl.from_pandas(parent.dropna().drop_duplicates().reset_index(drop=True))
+    return (~pl.col(col).is_in(vals.implode()).fill_null(False)).cast(pl.Int64)
+
+
+def _anti(child: pd.DataFrame, key: str, ids: pl.LazyFrame) -> int:
+    """Rows of the (small) child whose ``key`` has no match in ``ids`` (column ``id``)."""
+    c = _small(child, [key])
+    return int(c.join(ids, left_on=key, right_on="id", how="anti")
+               .select(pl.len()).collect().item())
+
+
+def tx_metrics(txl: pl.LazyFrame, *, dims: dict, facts: dict, dd_keys: set) -> dict:
+    """Every fact_transaction-derived figure the validation report needs."""
+    acct, cust, merch = dims["dim_account"], dims["dim_customer"], dims["dim_merchant"]
+    card, stmt = dims["dim_card"], facts["fact_statement"]
+    txl = txl.with_columns(pl.col("transaction_date").cast(pl.Datetime("ns")))
+    amt = pl.col("amount_usd").cast(pl.Float64, strict=False)
+    pos = amt.filter(amt > 0)
+    purchase = pl.col("transaction_type") == "PURCHASE"
+    approved = pl.col("status") == "APPROVED"
+    qs = (0.05, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99)
+    exprs = [
+        pl.len().alias("n"),
+        pl.col("transaction_id").n_unique().alias("tid_nunique"),
+        pl.col("transaction_id").null_count().alias("tid_nulls"),
+        _not_in("account_id", acct.account_id).sum().alias("fk_account"),
+        _not_in("customer_id", cust.customer_id).sum().alias("fk_customer"),
+        _not_in("card_id", card.card_id).sum().alias("fk_card"),
+        _not_in("merchant_id", merch.merchant_id).sum().alias("fk_merchant"),
+        _not_in("statement_id", stmt.statement_id).sum().alias("fk_statement"),
+        pl.col("merchant_id").is_not_null().any().alias("merchant_any"),
+        pl.col("transaction_date").min().alias("dmin"),
+        pl.col("transaction_date").max().alias("dmax"),
+        (pl.col("currency_code") == "PHP").sum().alias("php"),
+        (pl.col("currency_code") == "USD").sum().alias("usd"),
+        amt.max().alias("amt_max"),
+        ((amt < 0) & purchase).sum().alias("neg_purchases"),
+        approved.sum().alias("approved"),
+        pl.col("status").is_not_null().sum().alias("status_nonnull"),
+        (pl.col("transaction_type") == "REFUND").sum().alias("refunds"),
+        purchase.sum().alias("purchases"),
+        pl.col("merchant_geo_id").null_count().alias("null_geo"),
+        amt.filter(pl.col("is_installment_financed")).sum().alias("financed_sum"),
+        amt.filter(approved & purchase).sum().alias("approved_purchase_spend"),
+        (pl.col("auth_code").cast(pl.String).str.len_chars() != 6).fill_null(True)
+        .filter(approved).sum().alias("bad_auth"),
+        _not_in("date_key", pd.Series(sorted(dd_keys))).sum().alias("date_key_miss"),
+        pos.mean().alias("pos_mean"), pos.sum().alias("pos_sum"), pos.max().alias("pos_max"),
+    ] + [pos.quantile(q, interpolation="linear").alias(f"q{q}") for q in qs]
+    m = txl.select(exprs).collect(engine="streaming").row(0, named=True)
+    m["dmin"], m["dmax"] = m["dmin"].date(), m["dmax"].date()
+    m["approved_share"] = m["approved"] / max(m["status_nonnull"], 1)
+
+    def grp(lf, key, agg, name):
+        out = lf.group_by(key).agg(agg.alias(name)).filter(pl.col(key).is_not_null())
+        return out.collect(engine="streaming").to_pandas()
+
+    pur = txl.filter(purchase)
+    m["per_stmt"] = grp(pur, "statement_id", pl.len(), "n")
+    m["per_acct"] = grp(pur, "account_id", pl.len(), "n").set_index("account_id")["n"]
+    pur_ok = txl.filter(purchase & approved & ~pl.col("is_installment_financed"))
+    m["agg_p"] = grp(pur_ok, "statement_id", amt.sum(), "tx_purch").set_index("statement_id")["tx_purch"]
+    ref = txl.filter(pl.col("transaction_type") == "REFUND")
+    m["agg_r"] = grp(ref, "statement_id", amt.sum(), "tx_ref").set_index("statement_id")["tx_ref"]
+
+    # orphans against transaction_id: anti-joins keep memory at the child's size
+    ids = txl.select(pl.col("transaction_id").alias("id"))
+    m["plan_orphans"] = _anti(facts["fact_installment_plan"], "transaction_id", ids)
+    m["fraud_orphans"] = _anti(facts["fact_fraud_alert"], "transaction_id", ids)
+    appr_ids = txl.filter(approved).select(pl.col("transaction_id").alias("id"))
+    fr = facts["fact_fraud_alert"]
+    m["fraud_loss_unsettled"] = 0 if fr.empty else _anti(
+        fr[fr.loss_amount > 0], "transaction_id", appr_ids)
+    m["refund_missing"] = int(ref.select(pl.col("original_transaction_id").null_count())
+                              .collect().item())
+    m["refund_bad"] = int(
+        ref.filter(pl.col("original_transaction_id").is_not_null())
+        .join(ids, left_on="original_transaction_id", right_on="id", how="anti")
+        .select(pl.len()).collect().item())
+
+    exp = card[["card_id", "expiry_year", "expiry_month"]].copy()
+    exp["expiry_end"] = (pd.to_datetime(dict(year=exp.expiry_year, month=exp.expiry_month, day=1))
+                         + pd.offsets.MonthEnd(0))
+    em = txl.join(_small(exp, ["card_id", "expiry_end"], ("expiry_end",)), on="card_id", how="left")
+    m["after_exp"] = int(em.select((pl.col("transaction_date") > pl.col("expiry_end")).sum())
+                         .collect().item())
+
+    mc = _small(merch, ["merchant_id", "mcc", "category", "merchant_name", "geo_id", "country_code"])
+    mm = txl.select("merchant_id", "mcc", "category", "merchant_name", "merchant_geo_id",
+                    "is_international").join(mc, on="merchant_id", how="left", suffix="_m")
+    bad = mm.select(
+        pl.col("mcc").ne_missing(pl.col("mcc_m")).sum().alias("bad_mcc"),
+        pl.col("category").ne_missing(pl.col("category_m")).sum().alias("bad_cat"),
+        pl.col("merchant_geo_id").ne_missing(pl.col("geo_id")).sum().alias("bad_geo"),
+        pl.col("is_international").ne_missing(
+            pl.col("country_code").ne_missing(pl.lit("US"))).sum().alias("bad_intl"),
+    ).collect(engine="streaming").row(0, named=True)
+    m.update(bad)
+
+    ct = _small(card, ["card_id", "issue_date", "replaced_date"], ("issue_date", "replaced_date"))
+    cm = txl.join(ct, on="card_id", how="left").select(
+        (pl.col("transaction_date") < pl.col("issue_date")).sum().alias("before_issue"),
+        (pl.col("replaced_date").is_not_null()
+         & (pl.col("transaction_date") > pl.col("replaced_date"))).sum().alias("after_repl"),
+    ).collect(engine="streaming").row(0, named=True)
+    m.update(cm)
+    ac = _small(acct, ["account_id", "closed_date"], ("closed_date",))
+    m["after_close"] = int(
+        txl.join(ac, on="account_id", how="left")
+        .select((pl.col("closed_date").is_not_null()
+                 & (pl.col("transaction_date") > pl.col("closed_date"))).sum())
+        .collect(engine="streaming").item())
+    ch = cust[cust.churn_date.notna()]
+    m["after_churn"] = int(
+        txl.join(_small(ch, ["customer_id", "churn_date"], ("churn_date",)),
+                 on="customer_id", how="inner")
+        .select((pl.col("transaction_date") > pl.col("churn_date")).sum())
+        .collect(engine="streaming").item())
+
+    m["monthly"] = (
+        txl.group_by(pl.col("transaction_date").dt.strftime("%Y-%m").alias("m"))
+        .agg(pl.len().alias("n"), amt.clip(lower_bound=0).sum().alias("spend"))
+        .filter(pl.col("m").is_not_null()).sort("m")
+        .collect(engine="streaming").to_pandas().set_index("m"))
+
+    def mix(col, head=None):
+        s = (txl.filter(pl.col(col).is_not_null()).group_by(col).len()
+             .sort(["len", col], descending=[True, False]).collect(engine="streaming"))
+        tot = s["len"].sum()
+        out = pd.Series(s["len"].to_numpy() / tot, index=s[col].to_list())
+        return out.head(head) if head else out
+
+    m["channel_mix"], m["mcc_mix"] = mix("channel_group"), mix("mcc", 8)
+
+    cols = txl.collect_schema().names()
+    base = txl.filter(approved)
+    if "network" not in cols:
+        base = base.join(_small(acct, ["account_id", "network"]), on="account_id", how="left")
+    m["net_tx"] = (base.filter(pl.col("network").is_not_null()).group_by("network")
+                   .agg(pl.len().alias("n"), amt.sum().alias("spend"))
+                   .collect(engine="streaming").to_pandas().set_index("network"))
+    return m
+
+
 def run(dims: dict, facts: dict, raw: dict) -> str:
     rep = Report()
-    tx = facts["fact_transaction"]
+    tx_in = facts["fact_transaction"]
+    txl = tx_in if isinstance(tx_in, pl.LazyFrame) else pl.from_pandas(tx_in).lazy()
     stmt = facts["fact_statement"]
     pay = facts["fact_payment"]
     alloc = facts["fact_payment_allocation"]
@@ -225,11 +391,14 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
     merch = dims["dim_merchant"]
     geo = dims["dim_location"]
     date = dims["dim_date"]
+    dd_keys = set(date.date_key)
+    M = tx_metrics(txl, dims=dims, facts=facts, dd_keys=dd_keys)
+    n_tx = M["n"]
 
     # ---------------- volumes ----------------
     for name, df in [("dim_customer", cust), ("dim_account", acct), ("dim_card", dims["dim_card"]),
                      ("dim_merchant", merch), ("dim_location", geo), ("dim_date", date),
-                     ("fact_transaction", tx), ("fact_statement", stmt), ("fact_payment", pay), ("fact_payment_allocation", alloc),
+                     ("fact_transaction", range(n_tx)), ("fact_statement", stmt), ("fact_payment", pay), ("fact_payment_allocation", alloc),
                      ("fact_installment_allocation", ialloc),
                      ("fact_installment_plan", plan), ("fact_installment_schedule", sched),
                      ("fact_credit_limit_event", lim), ("fact_delinquency_snapshot", delinq),
@@ -241,18 +410,24 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
         ("dim_customer", cust, "customer_id"), ("dim_account", acct, "account_id"),
         ("dim_card", dims["dim_card"], "card_id"), ("dim_merchant", merch, "merchant_id"),
         ("dim_location", geo, "geo_id"), ("dim_date", date, "date_key"),
-        ("fact_transaction", tx, "transaction_id"), ("fact_statement", stmt, "statement_id"),
+        ("fact_transaction", None, "transaction_id"), ("fact_statement", stmt, "statement_id"),
         ("fact_payment", pay, "payment_id"),
         ("fact_payment_allocation", alloc, "allocation_id"),
         ("fact_installment_allocation", ialloc, "allocation_id"), ("fact_installment_plan", plan, "plan_id"),
         ("fact_installment_schedule", sched, "schedule_id"),
         ("fact_fraud_alert", fraud, "alert_id"), ("fact_app_event", ev, "event_id"),
     ]:
-        if df.empty:
+        if df is None:  # fact_transaction: counted lazily
+            if n_tx == 0:
+                rep.check(f"PK unique: {name}", None, "empty table", "WARN")
+                continue
+            dup, nul = n_tx - M["tid_nunique"], M["tid_nulls"]
+        elif df.empty:
             rep.check(f"PK unique: {name}", None, "empty table", "WARN")
             continue
-        dup = int(df[key].duplicated().sum())
-        nul = int(df[key].isna().sum())
+        else:
+            dup = int(df[key].duplicated().sum())
+            nul = int(df[key].isna().sum())
         rep.check(f"PK unique: {name}", dup == 0 and nul == 0, f"duplicates={dup}, nulls={nul}")
 
     # ---------------- referential integrity ----------------
@@ -263,12 +438,18 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
         orphans = int((~child[ck].isin(set(parent[pk]))).sum())
         rep.check(f"FK: {label}", orphans == 0, f"orphans={orphans}")
 
-    fk(tx, "account_id", acct, "account_id", "transaction.account -> account")
-    fk(tx, "customer_id", cust, "customer_id", "transaction.customer -> customer")
-    fk(tx, "card_id", dims["dim_card"], "card_id", "transaction.card -> card")
-    if tx.merchant_id.notna().any():
-        fk(tx, "merchant_id", merch, "merchant_id", "transaction.merchant -> merchant")
-    fk(tx, "statement_id", stmt, "statement_id", "transaction.statement -> statement")
+    def fk_tx(orphans, label):
+        if n_tx == 0:
+            rep.check(f"FK: {label}", None, "child empty", "WARN")
+        else:
+            rep.check(f"FK: {label}", orphans == 0, f"orphans={orphans}")
+
+    fk_tx(M["fk_account"], "transaction.account -> account")
+    fk_tx(M["fk_customer"], "transaction.customer -> customer")
+    fk_tx(M["fk_card"], "transaction.card -> card")
+    if M["merchant_any"]:
+        fk_tx(M["fk_merchant"], "transaction.merchant -> merchant")
+    fk_tx(M["fk_statement"], "transaction.statement -> statement")
     fk(stmt, "account_id", acct, "account_id", "statement.account -> account")
     fk(pay, "account_id", acct, "account_id", "payment.account -> account")
     fk(alloc, "payment_id", pay, "payment_id", "allocation.payment -> payment")
@@ -276,28 +457,35 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
     fk(ialloc, "payment_id", pay, "payment_id", "instalment_allocation.payment -> payment")
     fk(ialloc, "schedule_id", sched, "schedule_id", "instalment_allocation.schedule -> schedule")
     fk(plan, "account_id", acct, "account_id", "plan.account -> account")
-    fk(plan, "transaction_id", tx, "transaction_id", "plan.transaction -> transaction")
+    if plan.empty:
+        rep.check("FK: plan.transaction -> transaction", None, "child empty", "WARN")
+    else:
+        rep.check("FK: plan.transaction -> transaction", M["plan_orphans"] == 0,
+                  f"orphans={M['plan_orphans']}")
     fk(sched, "plan_id", plan, "plan_id", "schedule.plan -> plan")
     fk(lim, "account_id", acct, "account_id", "limit_event.account -> account")
     fk(delinq, "account_id", acct, "account_id", "delinquency.account -> account")
-    fk(fraud, "transaction_id", tx, "transaction_id", "fraud.transaction -> transaction")
+    if fraud.empty:
+        rep.check("FK: fraud.transaction -> transaction", None, "child empty", "WARN")
+    else:
+        rep.check("FK: fraud.transaction -> transaction", M["fraud_orphans"] == 0,
+                  f"orphans={M['fraud_orphans']}")
     fk(fraud, "customer_id", cust, "customer_id", "fraud.customer -> customer")
     fk(ev, "customer_id", cust, "customer_id", "app_event.customer -> customer")
     fk(acct, "customer_id", cust, "customer_id", "account.customer -> customer")
     fk(cust, "home_geo_id", geo, "geo_id", "customer.home_geo -> location")
 
     # ---------------- date coverage ----------------
-    dmin = pd.to_datetime(tx.transaction_date).min().date()
-    dmax = pd.to_datetime(tx.transaction_date).max().date()
+    dmin, dmax = M["dmin"], M["dmax"]
     rep.check("Transaction date coverage", dmin >= C.PERIOD_START and dmax <= C.PERIOD_END,
               f"{dmin} .. {dmax}")
     months = sorted(pd.to_datetime(stmt.statement_date).dt.strftime("%Y-%m").unique())
     rep.check("Statements cover every month", len(months) == 13, f"{len(months)} months: {months[0]}..{months[-1]}")
 
     # ---------------- currency & geography ----------------
-    fx_bad = int((tx.currency_code == "PHP").sum())
+    fx_bad = int(M["php"])
     rep.check("No PHP transactions remain", fx_bad == 0, f"PHP rows={fx_bad}")
-    usd_share = float((tx.currency_code == "USD").mean())
+    usd_share = M["usd"] / n_tx
     rep.check("USD share of transactions", usd_share > 0.90, f"{usd_share:.1%} USD, {1-usd_share:.1%} FX")
     us_states = set(geo.state_code.dropna().unique())
     cust_in_us = float(cust.state_code.isin(us_states).mean()) if len(us_states) else 0
@@ -310,7 +498,7 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
     rep.check("dim_merchant has no PH merchants", ph_merch == 0, f"PH merchants={ph_merch}")
 
     # ---------------- amount distribution (US card norms) ----------------
-    p = {q: _pct(tx.amount_usd, q) for q in (0.25, 0.5, 0.75, 0.95, 0.99)}
+    p = {q: _rq(M, q) for q in (0.25, 0.5, 0.75, 0.95, 0.99)}
     med = p[0.5]
     rep.check("Median ticket at US norm",
               0.72 * C.US_TICKET_MEDIAN <= med <= 1.3 * C.US_TICKET_MEDIAN,
@@ -318,34 +506,30 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
     rep.check("p95 ticket at US norm",
               0.7 * C.US_TICKET_P95 <= p[0.95] <= 1.4 * C.US_TICKET_P95,
               f"synthetic=${p[0.95]} vs target=${C.US_TICKET_P95}")
-    rep.check("Amount tail present", float(tx.amount_usd.max()) > 2000,
-              f"max=${tx.amount_usd.max():,.0f}")
-    rep.check("No negative purchases", int((tx.loc[tx.transaction_type == "PURCHASE", "amount_usd"] < 0).sum()) == 0,
+    rep.check("Amount tail present", float(M["amt_max"]) > 2000,
+              f"max=${M['amt_max']:,.0f}")
+    rep.check("No negative purchases", int(M["neg_purchases"]) == 0,
               "purchase sign convention")
 
     # ---------------- authorisation mix ----------------
-    status_mix = tx.status.value_counts(normalize=True).to_dict()
-    appr = status_mix.get("APPROVED", 0)
+    appr = M["approved_share"]
     rep.check("Approval rate 80-98%", 0.80 <= appr <= 0.98,
               f"{appr:.1%} approved (heavy-user segments push limit declines up)")
-    repay = float((tx.transaction_type == "REFUND").mean())
+    repay = M["refunds"] / n_tx
     rep.check("Refund share 0.5-4%", 0.005 <= repay <= 0.04, f"{repay:.2%}")
 
-    pur_tx = tx[tx.transaction_type == "PURCHASE"]
-    per_stmt = pur_tx.groupby("statement_id").size().rename("n").reset_index()
-    per_stmt = per_stmt.merge(stmt[["statement_id", "account_id", "month_key"]],
+    per_stmt = M["per_stmt"].merge(stmt[["statement_id", "account_id", "month_key"]],
                               on="statement_id", how="left")
     monthly = per_stmt.n
 
     rep.check("Median transactions per account-month ~15",
               12.0 <= float(monthly.median()) <= 18.0,
               f"median={float(monthly.median()):.0f} per account-month")
-    mean_freq = float(len(pur_tx) / max(1, len(stmt)))
+    mean_freq = float(M["purchases"] / max(1, len(stmt)))
     rep.check("Mean transactions per account per month plausible",
               10.0 <= mean_freq <= 26.0, f"mean={mean_freq:.2f}/month")
 
-    per_acct = (pur_tx.groupby("account_id").size()
-                / stmt.groupby("account_id").size()).dropna()
+    per_acct = (M["per_acct"] / stmt.groupby("account_id").size()).dropna()
     seg = acct[["account_id", "customer_id"]].merge(
         cust[["customer_id", "customer_segment"]], on="customer_id", how="left")
     f = per_acct.rename("freq").reset_index().merge(seg, on="account_id", how="left")
@@ -391,15 +575,13 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
               "min due capped at balance")
 
     # ---------------- independent reconciliation: transactions <-> statements
-    pur_ok = tx[(tx.transaction_type == "PURCHASE") & (tx.status == "APPROVED")
-                & (~tx.is_installment_financed)]
-    agg_p = pur_ok.groupby("statement_id").amount_usd.sum().rename("tx_purch")
+    agg_p = M["agg_p"]
     cmp_p = stmt.set_index("statement_id")[["purchases_amount"]].join(agg_p, how="left").fillna(0.0)
     dp = (cmp_p.purchases_amount - cmp_p.tx_purch).abs()
     rep.check("Statements reconcile to underlying purchases", float(dp.max()) < 0.01,
               f"max delta=${dp.max():.2f}")
 
-    agg_r = tx[tx.transaction_type == "REFUND"].groupby("statement_id").amount_usd.sum().rename("tx_ref")
+    agg_r = M["agg_r"]
     cmp_r = stmt.set_index("statement_id")[["refunds_amount"]].join(agg_r, how="left").fillna(0.0)
     drr = (cmp_r.refunds_amount - cmp_r.tx_ref).abs()
     rep.check("Statements reconcile to underlying refunds", float(drr.max()) < 0.01,
@@ -495,7 +677,7 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
 
     null_geo_merch = int(dims["dim_merchant"].geo_id.isna().sum())
     rep.check("Every merchant has a location", null_geo_merch == 0, f"{null_geo_merch} merchants")
-    null_geo_tx = int(tx.merchant_geo_id.isna().sum())
+    null_geo_tx = int(M["null_geo"])
     rep.check("Every transaction has a merchant location", null_geo_tx == 0, f"{null_geo_tx} rows")
 
     # ---------------- raw layer referential integrity ----------------
@@ -509,10 +691,7 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
     neg_no_bal = int(((stmt.payment_status == "NO_BALANCE") & (stmt.closing_balance < -0.01)).sum())
     rep.check("Credit balances are not labelled NO_BALANCE", neg_no_bal == 0, f"{neg_no_bal} rows")
 
-    exp = dims["dim_card"][["card_id", "expiry_year", "expiry_month"]].copy()
-    exp["expiry_end"] = pd.to_datetime(dict(year=exp.expiry_year, month=exp.expiry_month, day=1)) + pd.offsets.MonthEnd(0)
-    em = tx[["transaction_date", "card_id"]].merge(exp[["card_id", "expiry_end"]], on="card_id", how="left")
-    after_exp = int((em.transaction_date > em.expiry_end).sum())
+    after_exp = int(M["after_exp"])
     rep.check("No transaction after card expiry", after_exp == 0, f"{after_exp} rows")
 
     overdue_sched = sched[(sched.due_date <= pd.Timestamp(C.PERIOD_END)) &
@@ -525,8 +704,7 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
 
     # ---------------- new v6 integrity checks ----------------
     # financed purchases reconcile to plan principal and leave the revolving ledger
-    fin = tx[tx.is_installment_financed]
-    fin_delta = abs(float(fin.amount_usd.sum()) - float(plan.principal_amount.sum()))
+    fin_delta = abs(float(M["financed_sum"]) - float(plan.principal_amount.sum()))
     rep.check("Financed purchases equal plan principal", fin_delta < 1.0,
               "difference " + format(fin_delta, ",.2f"))
 
@@ -540,14 +718,8 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
     rep.check("Every PAID instalment has a cash payment", missing_cash == 0, str(missing_cash) + " rows")
 
     # merchant denormalisation and international classification
-    mm = tx[["merchant_id", "mcc", "category", "merchant_name", "merchant_geo_id",
-             "is_international"]].merge(
-        merch[["merchant_id", "mcc", "category", "merchant_name", "geo_id", "country_code"]],
-        on="merchant_id", how="left", suffixes=("_tx", "_m"))
-    bad_mcc = int((mm.mcc_tx != mm.mcc_m).sum())
-    bad_cat = int((mm.category_tx != mm.category_m).sum())
-    bad_geo = int((mm.merchant_geo_id != mm.geo_id).sum())
-    bad_intl = int((mm.is_international != (mm.country_code != "US")).sum())
+    bad_mcc, bad_cat = int(M["bad_mcc"]), int(M["bad_cat"])
+    bad_geo, bad_intl = int(M["bad_geo"]), int(M["bad_intl"])
     rep.check("Transaction MCC matches merchant", bad_mcc == 0, str(bad_mcc) + " rows")
     rep.check("Transaction category matches merchant", bad_cat == 0, str(bad_cat) + " rows")
     rep.check("Transaction merchant geo matches merchant", bad_geo == 0, str(bad_geo) + " rows")
@@ -568,9 +740,7 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
                   str(late_close) + " accounts")
 
     # refund lineage
-    ref = tx[tx.transaction_type == "REFUND"]
-    ref_missing = int(ref.original_transaction_id.isna().sum())
-    ref_bad = int((~ref.original_transaction_id.dropna().isin(set(tx.transaction_id))).sum())
+    ref_missing, ref_bad = int(M["refund_missing"]), int(M["refund_bad"])
     rep.check("Every refund has a parent transaction", ref_missing == 0, str(ref_missing) + " rows")
     rep.check("Every refund parent exists", ref_bad == 0, str(ref_bad) + " rows")
 
@@ -587,19 +757,18 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
         blk = fraud[fraud.decision == "BLOCK"]
         blk_loss = int((blk.loss_amount > 0.01).sum())
         rep.check("Blocked fraud attempts carry no loss", blk_loss == 0, str(blk_loss) + " rows")
-        loss_on_approved = int(((fraud.loss_amount > 0) &
-                                (~fraud.transaction_id.isin(tx.loc[tx.status == "APPROVED", "transaction_id"]))).sum())
+        loss_on_approved = int(M["fraud_loss_unsettled"])
         rep.check("Fraud loss only on settled transactions", loss_on_approved == 0,
                   str(loss_on_approved) + " rows")
 
     # date coverage for every fact with a date key
-    dd_keys = set(dims["dim_date"].date_key)
-    for nm, dfx in [("transaction", tx), ("statement", stmt), ("payment", pay),
+    for nm, dfx in [("transaction", None), ("statement", stmt), ("payment", pay),
                     ("payment_allocation", alloc), ("instalment_schedule", sched),
                     ("instalment_allocation", ialloc), ("credit_limit_event", lim),
                     ("delinquency_snapshot", delinq), ("fraud_alert", fraud),
                     ("app_event", ev)]:
-        miss = int((~dfx.date_key.isin(dd_keys)).sum())
+        miss = (int(M["date_key_miss"]) if dfx is None
+                else int((~dfx.date_key.isin(dd_keys)).sum()))
         rep.check("Date keys covered: " + nm, miss == 0, str(miss) + " rows")
 
     # payment typing
@@ -626,8 +795,7 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
     bad_min = int((stmt.loc[stmt.closing_balance <= 0, "minimum_due"].abs() > 0.01).sum())
     rep.check("No minimum due on non-positive balances", bad_min == 0, str(bad_min) + " rows")
 
-    appr_tx = tx[tx.status == "APPROVED"]
-    bad_auth = int((appr_tx.auth_code.astype(str).str.len() != 6).sum())
+    bad_auth = int(M["bad_auth"])
     rep.check("Auth codes are six digits on approvals", bad_auth == 0, str(bad_auth) + " rows")
 
     dup_email = int(cust.email.duplicated().sum())
@@ -660,21 +828,14 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
         rep.check("Statement limit equals pre-event limit on event dates", sd_bad == 0, str(sd_bad) + " rows")
 
     # ---------------- temporal / lifecycle integrity ----------------
-    card_tbl = dims["dim_card"][["card_id", "issue_date", "replaced_date"]]
-    cm = tx[["transaction_date", "card_id"]].merge(card_tbl, on="card_id", how="left")
-    before_issue = int((cm.transaction_date < cm.issue_date).sum())
-    after_repl = int(((cm.replaced_date.notna()) & (cm.transaction_date > cm.replaced_date)).sum())
+    before_issue, after_repl = int(M["before_issue"]), int(M["after_repl"])
     rep.check("No transaction before card issue", before_issue == 0, f"{before_issue} rows")
     rep.check("No transaction after card replacement", after_repl == 0, f"{after_repl} rows")
 
-    ac = acct[["account_id", "closed_date"]]
-    am = tx[["transaction_date", "account_id"]].merge(ac, on="account_id", how="left")
-    after_close = int((am.closed_date.notna() & (am.transaction_date > am.closed_date)).sum())
+    after_close = int(M["after_close"])
     rep.check("No transaction after account closure", after_close == 0, f"{after_close} rows")
 
-    churned = cust[cust.churn_date.notna()][["customer_id", "churn_date"]]
-    cm2 = tx[["transaction_date", "customer_id"]].merge(churned, on="customer_id", how="inner")
-    after_churn = int((cm2.transaction_date > cm2.churn_date).sum())
+    after_churn = int(M["after_churn"])
     rep.check("No transaction after customer churn", after_churn == 0, f"{after_churn} rows")
 
     co = acct[acct.account_status == "CHARGED_OFF"]
@@ -704,14 +865,14 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
               f"{len(delinq)} snapshots vs {len(stmt)} statements")
 
     # ---------------- fraud ----------------
-    f_rate = len(fraud) / max(1, int((tx.status == "APPROVED").sum()))
+    f_rate = len(fraud) / max(1, int(M["approved"]))
     rep.check("Fraud alert rate 0.1-0.8%", 0.001 <= f_rate <= 0.008, f"{f_rate:.2%} of approved txns")
     if not fraud.empty:
         conf = float((fraud.case_status == "CONFIRMED_FRAUD").mean())
         rep.check("Confirmed fraud share 20-55%", 0.20 <= conf <= 0.55, f"{conf:.1%}")
         loss = float(fraud.net_loss.sum())
         rep.check("Net fraud loss reported", loss >= 0, f"${loss:,.0f}")
-        ok, detail = check_fraud_loss_band(fraud, tx)
+        ok, detail = check_fraud_loss_band_spend(fraud, float(M["approved_purchase_spend"]))
         rep.check("Fraud net loss within 3-12 bps", ok, detail)
 
 
@@ -736,7 +897,7 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
     rep.check("Charge-off incidence supports structural claims", ok, detail)
 
     # ---------------- installment plans ----------------
-    plan_share = len(plan) / max(1, int((tx.transaction_type == "PURCHASE").sum()))
+    plan_share = len(plan) / max(1, int(M["purchases"]))
     rep.check("Pay-over-time penetration 0.5-5%", 0.005 <= plan_share <= 0.05, f"{plan_share:.2%} of purchases")
     rep.check("Every plan has schedule rows", set(plan.plan_id) == set(sched.plan_id),
               f"{sched.plan_id.nunique()} plans with schedules")
@@ -779,10 +940,10 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
 
     rep.check("Raw card_account rows = dim_account",
               near(len(raw["card_account"]), len(acct), 0.001), f"{len(raw['card_account'])} vs {len(acct)}")
-    exp_tx = min(len(tx), C.RAW_TXN_CAP)
+    exp_tx = min(n_tx, C.RAW_TXN_CAP)
     rep.check("Raw card_purchase is the documented sample",
               len(raw["card_purchase"]) == exp_tx,
-              f"{len(raw['card_purchase']):,} of {len(tx):,} transactions")
+              f"{len(raw['card_purchase']):,} of {n_tx:,} transactions")
     exp_pay = min(len(pay), C.RAW_PAYMENT_CAP) * 3
     rep.check("Raw card_payment_workflow is the documented sample",
               len(raw["card_payment_workflow"]) == exp_pay,
@@ -796,16 +957,14 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
 
     lines += ["", "## Appendix A - transaction amount distribution", "",
               "| Statistic | Synthetic USD |", "|---|---|"]
-    s = pd.to_numeric(tx.amount_usd, errors="coerce")
-    s = s[s > 0]
-    for label, q in [("p25", .25), ("p50", .5), ("p75", .75), ("p90", .9), ("p95", .95),
-                     ("p99", .99), ("max", 1.0)]:
-        lines.append(f"| {label} | ${s.quantile(q):,.2f} |")
-    lines.append(f"| mean | ${s.mean():,.2f} |")
-    lines.append(f"| total spend | ${s.sum():,.0f} |")
+    for label, key in [("p25", "q0.25"), ("p50", "q0.5"), ("p75", "q0.75"), ("p90", "q0.9"),
+                       ("p95", "q0.95"), ("p99", "q0.99"), ("max", "pos_max")]:
+        lines.append(f"| {label} | ${M[key]:,.2f} |")
+    lines.append(f"| mean | ${M['pos_mean']:,.2f} |")
+    lines.append(f"| total spend | ${M['pos_sum']:,.0f} |")
 
     if not src.empty:
-        syn = {q: _pct(tx.amount_usd, q) for q in (0.05, 0.25, 0.5, 0.75, 0.95, 0.99)}
+        syn = {q: _rq(M, q) for q in (0.05, 0.25, 0.5, 0.75, 0.95, 0.99)}
         lines += ["", "### Comparison with the source (intentionally NOT 1:1)", "",
                   "The source is a Philippine BNPL book priced in PHP. A 1:1 PHP->USD "
                   "carry-over was evaluated and rejected: at the target frequency of 15 "
@@ -825,12 +984,12 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
     lines += ["", "## Appendix B - volume by month", "",
               "| Month | Transactions | Spend (USD) | Statements | Payments |",
               "|---|---|---|---|---|"]
-    txm = tx.assign(m=pd.to_datetime(tx.transaction_date).dt.strftime("%Y-%m"))
+    txm = M["monthly"]
     stm = stmt.assign(m=pd.to_datetime(stmt.statement_date).dt.strftime("%Y-%m"))
     pm = pay.assign(m=pd.to_datetime(pay.payment_date).dt.strftime("%Y-%m"))
-    for m in sorted(txm.m.unique()):
-        t = txm[txm.m == m]
-        lines.append(f"| {m} | {len(t):,} | ${t.amount_usd.clip(lower=0).sum():,.0f} | "
+    for m in txm.index:
+        t = txm.loc[m]
+        lines.append(f"| {m} | {int(t.n):,} | ${t.spend:,.0f} | "
                      f"{len(stm[stm.m == m]):,} | {len(pm[pm.m == m]):,} |")
 
     lines += ["", "## Appendix C - portfolio mix", "",
@@ -840,8 +999,8 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
         ("Risk tier", cust.risk_tier.value_counts(normalize=True)),
         ("Account status", acct.account_status.value_counts(normalize=True)),
         ("Delinquency bucket", delinq.delinquency_bucket.value_counts(normalize=True)),
-        ("Channel group", tx.channel_group.value_counts(normalize=True)),
-        ("Top MCC", tx.mcc.value_counts(normalize=True).head(8)),
+        ("Channel group", M["channel_mix"]),
+        ("Top MCC", M["mcc_mix"]),
     ]:
         txt = ", ".join(f"{k} {v:.1%}" for k, v in series.items())
         lines.append(f"| {label} | {txt} |")
@@ -854,14 +1013,7 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
         accounts=("account_id", "size"),
         limit=("credit_limit", "sum"),
         bal=("current_balance", "sum"))
-    if "network" in tx.columns:
-        net_tx = (tx[tx.status == "APPROVED"]
-                  .groupby("network")
-                  .agg(n=("transaction_id", "size"), spend=("amount_usd", "sum")))
-    else:
-        tmp = tx[tx.status == "APPROVED"][["transaction_id", "amount_usd", "account_id"]].merge(
-            acct[["account_id", "network"]], on="account_id", how="left")
-        net_tx = tmp.groupby("network").agg(n=("transaction_id", "size"), spend=("amount_usd", "sum"))
+    net_tx = M["net_tx"]
     for net in sorted(net_acct.index, key=lambda x: -net_acct.loc[x, "accounts"]):
         a = net_acct.loc[net]
         t = net_tx.loc[net] if net in net_tx.index else None

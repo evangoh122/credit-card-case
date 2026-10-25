@@ -133,7 +133,11 @@ Requirements: Python 3.14, pandas 2.3.3, numpy 2.5.4, pyarrow 25.0.1,
 polars 2.0.0 (see `pyproject.toml`). Postprocessing and the ML extracts read the
 470 MB `fact_transaction.parquet` with Polars (lazy scan / streaming sink) rather
 than loading it whole into pandas, which OOM'd v7; `run_all` also frees the
-in-memory tables after writing them. Regression: `tests/test_postprocess_polars.py`. Runtime ≈ 55 minutes for 50k customers.
+in-memory tables after writing them. Regression: `tests/test_postprocess_polars.py`. `refresh_docs`/validation/dictionary also profile it lazily
+(`validation.tx_metrics`, parquet metadata row counts); the churn and credit-default
+ML extracts keep label-defining columns (`customer_status`, `churn_date`,
+`account_status`, `closed_date`) out of the features, enforced by
+`ml_extracts.check_no_label_columns`. Tests: `tests/test_v7_polars_fixes.py`. Runtime ≈ 55 minutes for 50k customers.
 
 ---
 

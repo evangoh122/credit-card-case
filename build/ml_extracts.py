@@ -58,6 +58,21 @@ def check_no_leakage(df: pd.DataFrame,
     return bad == 0, f"{bad} rows with post-observation features (max +{max_gap} days)"
 
 
+# Columns that define (or are only known after) the label: never allowed in a
+# feature set. They may exist in the source tables and in the label audit only.
+LABEL_DEFINING_COLUMNS = {
+    "credit_default": ("account_status", "closed_date"),
+    "churn": ("customer_status", "churn_date"),
+}
+
+
+def check_no_label_columns(df: pd.DataFrame, task: str) -> tuple[bool, str]:
+    """Fail if any label-defining / post-observation column is in the feature set."""
+    present = [c for c in LABEL_DEFINING_COLUMNS[task] if c in df.columns]
+    return not present, (f"label-defining columns in features: {present}" if present
+                         else "no label-defining columns in features")
+
+
 def check_pr_auc(pr_auc: float, maximum: float | None = None) -> tuple[bool, str]:
     maximum = C.ML_PR_AUC_MAX if maximum is None else maximum
     return pr_auc < maximum, f"PR-AUC {pr_auc:.4f} (gate < {maximum})"
@@ -457,7 +472,8 @@ def build_credit_default(df: pd.DataFrame, accounts: pd.DataFrame,
     acct = accounts[["account_id", "open_date", "account_status", "closed_date"]].copy()
     acct["open_date"] = pd.to_datetime(acct.open_date)
     acct["closed_date"] = pd.to_datetime(acct.closed_date)
-    feats = feats.merge(acct, on="account_id", how="left")
+    # account_status / closed_date define the label: used below, never a feature
+    feats = feats.merge(acct[["account_id", "open_date"]], on="account_id", how="left")
     feats["months_on_book_obs"] = (
         (obs - pd.to_datetime(feats.open_date)).dt.days / 30.44).round(2)
 
@@ -480,9 +496,9 @@ def build_credit_default(df: pd.DataFrame, accounts: pd.DataFrame,
     feats["split_entity"] = np.where(
         feats.account_id.map(lambda x: _hash_bucket(x) == 0), "test", "train")
 
-    ok, detail = check_no_leakage(feats)
-    if not ok:
-        raise RuntimeError(f"credit_default leakage: {detail}")
+    for gate in (check_no_leakage(feats), check_no_label_columns(feats, "credit_default")):
+        if not gate[0]:
+            raise RuntimeError(f"credit_default leakage: {gate[1]}")
     write_parquet(feats, ML / "credit_default_features.parquet", "credit_default_features")
     write_parquet(feats[feats.split_entity == "train"],
                   ML / "credit_default_train.parquet", "credit_default_train")
@@ -509,9 +525,10 @@ def build_churn(df: pd.DataFrame, customers: pd.DataFrame,
         avg_ticket_90d=("amount_usd", "mean"),
         distinct_merchants_90d=("merchant_id", "nunique"))
     last_tx = df[df.transaction_date <= obs].groupby("customer_id").transaction_date.max()
+    # customer_status / churn_date define the label: kept out of the features
     feats = active[["customer_id", "onboarding_date", "credit_score", "income_annual",
-                    "customer_segment", "risk_tier", "customer_status",
-                    "churn_date"]].copy()
+                    "customer_segment", "risk_tier"]].copy()
+    churn_date = active.set_index("customer_id")["churn_date"]
     feats = feats.merge(agg, on="customer_id", how="left")
     feats["last_txn_date"] = feats.customer_id.map(last_tx)
     for col in ("txn_90d", "spend_90d", "avg_ticket_90d", "distinct_merchants_90d"):
@@ -528,7 +545,8 @@ def build_churn(df: pd.DataFrame, customers: pd.DataFrame,
                  "closing_balance": "balance_at_obs",
                  "utilization_pct": "utilization_at_obs"})
     feats = feats.merge(slast, on="customer_id", how="left")
-    feats["label_churn"] = ((feats.churn_date > obs) & (feats.churn_date <= end)).astype("int8")
+    cd = feats.customer_id.map(churn_date)
+    feats["label_churn"] = ((cd > obs) & (cd <= end)).astype("int8")
     feats["observation_date"] = obs
     feats["outcome_start"] = obs + pd.Timedelta(days=1)
     feats["outcome_end"] = end
@@ -537,9 +555,9 @@ def build_churn(df: pd.DataFrame, customers: pd.DataFrame,
     feats["split_entity"] = np.where(
         feats.customer_id.map(lambda x: _hash_bucket(x) == 0), "test", "train")
 
-    ok, detail = check_no_leakage(feats)
-    if not ok:
-        raise RuntimeError(f"churn leakage: {detail}")
+    for gate in (check_no_leakage(feats), check_no_label_columns(feats, "churn")):
+        if not gate[0]:
+            raise RuntimeError(f"churn leakage: {gate[1]}")
     write_parquet(feats, ML / "churn_features.parquet", "churn_features")
     write_parquet(feats[feats.split_entity == "train"],
                   ML / "churn_train.parquet", "churn_train")

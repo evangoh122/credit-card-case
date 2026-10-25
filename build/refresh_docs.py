@@ -14,6 +14,12 @@ from . import config as C
 from . import dictionary, validation
 from .utils import log, read_parquet
 import pandas as pd
+import polars as pl
+import pyarrow.parquet as pq
+
+# fact_transaction is the one table too large to hold in pandas: it stays a lazy
+# Polars scan and validation / dictionary / inventory profile it from the file.
+LAZY_FACTS = ("fact_transaction",)
 
 
 def load_all() -> tuple[dict, dict, dict]:
@@ -21,7 +27,7 @@ def load_all() -> tuple[dict, dict, dict]:
     for p in sorted(C.DIM_DIR.glob("*.parquet")):
         dims[p.stem] = read_parquet(p)
     for p in sorted(C.FACT_DIR.glob("*.parquet")):
-        facts[p.stem] = read_parquet(p)
+        facts[p.stem] = pl.scan_parquet(p) if p.stem in LAZY_FACTS else read_parquet(p)
     for p in sorted(C.RAW_DIR.glob("*.parquet")):
         raw[p.stem] = read_parquet(p)
     return dims, facts, raw
@@ -44,7 +50,7 @@ def main() -> int:
     inv = []
     for sub in ("dim", "fact", "raw"):
         for p in sorted((C.OUT / sub).glob("*.parquet")):
-            inv.append(dict(table=p.stem, rows=len(read_parquet(p)),
+            inv.append(dict(table=p.stem, rows=pq.ParquetFile(p).metadata.num_rows,
                             mb=round(p.stat().st_size / 1024 / 1024, 2)))
     pd.DataFrame(inv).to_csv(C.DOC_DIR / "table_inventory.csv", index=False)
     log("docs refreshed" + (f" -- {failed} FAILURES" if failed else ""))
