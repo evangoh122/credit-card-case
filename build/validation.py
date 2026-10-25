@@ -9,7 +9,7 @@ import datetime as dt
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
+import polars as pl
 
 from . import config as C
 from .utils import log
@@ -45,6 +45,67 @@ class Report:
         counts = d["result"].value_counts().to_dict()
         lines += ["", "**Summary:** " + ", ".join(f"{k}: {v}" for k, v in counts.items()), ""]
         return "\n".join(lines)
+
+
+def check_settlement_cash_conservation(stmt: pd.DataFrame, pay: pd.DataFrame):
+    """Per-account settlement must not exceed card cash (each dollar once).
+
+    Seeded-defect contract: if a regression restores the v6 suffix-cash reuse,
+    ``sum(paid_closing_amount)`` exceeds card cash and this returns ok=False.
+    """
+    if stmt.empty:
+        return True, "no statements"
+    card = pay.loc[pay.payment_type == "CARD", ["account_id", "amount_usd"]]
+    cash = card.groupby("account_id").amount_usd.sum()
+    settled = stmt.groupby("account_id").paid_closing_amount.sum()
+    cmp = pd.concat([cash.rename("cash"), settled.rename("settled")], axis=1).fillna(0.0)
+    excess = cmp.settled - cmp.cash
+    n_over = int((excess > 0.01).sum())
+    max_excess = float(excess.max()) if len(excess) else 0.0
+    total_cash = float(cmp.cash.sum())
+    total_settled = float(cmp.settled.sum())
+    ok = n_over == 0 and total_settled <= total_cash + 1.0
+    return ok, (f"{n_over} accounts over cash, total settled ${total_settled:,.2f} "
+                f"vs cash ${total_cash:,.2f}, max excess ${max_excess:,.2f}")
+
+
+def check_statement_continuity(stmt: pd.DataFrame):
+    """opening(i+1) = closing(i) for every account, max residual < $0.01."""
+    if stmt.empty:
+        return True, "no statements"
+    s = stmt.sort_values(["account_id", "statement_date"]).copy()
+    prev_close = s.groupby("account_id")["closing_balance"].shift(1)
+    residual = (s.opening_balance - prev_close).abs().dropna()
+    max_res = float(residual.max()) if len(residual) else 0.0
+    return max_res < 0.01, f"max residual ${max_res:.2f} across {len(residual):,} rolls"
+
+
+def check_fraud_loss_band(fraud: pd.DataFrame, tx: pd.DataFrame):
+    """Net fraud loss must sit in the 3-12 bps band of approved purchase spend."""
+    spend = float(tx.loc[(tx.status == "APPROVED")
+                         & (tx.transaction_type == "PURCHASE"), "amount_usd"].sum())
+    loss = float(fraud.net_loss.sum()) if not fraud.empty else 0.0
+    bps = (loss / spend) if spend > 0 else 0.0
+    ok = 0.0003 <= bps <= 0.0012
+    return ok, f"net loss ${loss:,.2f} / approved purchase spend ${spend:,.2f} = {bps*10000:.2f} bps"
+
+
+def check_chargeoff_incidence(acct: pd.DataFrame, minimum: int | None = None):
+    """At least ``minimum`` charge-offs, so recovery claims are not measured on 4 rows."""
+    minimum = C.CHARGE_OFF_MIN_COUNT if minimum is None else minimum
+    n = int((acct.account_status == "CHARGED_OFF").sum())
+    return n >= minimum, f"{n} charge-offs (gate >= {minimum})"
+
+
+def check_accepted_limitations(doc_dir):
+    """The auth_code reuse decision must be recorded as an accepted limitation."""
+    path = doc_dir / "accepted_limitations.md"
+    if not path.exists():
+        return False, "docs/accepted_limitations.md missing"
+    text = path.read_text(encoding="utf-8")
+    ok = "auth_code" in text and "accepted limitation" in text.lower()
+    return ok, ("accepted-limitation entry present" if ok else
+                "accepted_limitations.md does not record auth_code")
 
 
 def _pct(series, q):
@@ -133,8 +194,9 @@ def source_percentiles() -> pd.DataFrame:
         files = sorted(C.SOURCE_DIR.glob("bnpl_purchase_[0-9]*.parquet"))
         if not files:
             return pd.DataFrame()
-        df = pd.concat([pq.read_table(f, columns=["AMOUNT"]).to_pandas() for f in files])
-        s = pd.to_numeric(df.AMOUNT, errors="coerce").dropna()
+        df = pl.concat([pl.read_parquet(f, columns=["AMOUNT"]) for f in files],
+                       how="vertical_relaxed")
+        s = pd.to_numeric(df.get_column("AMOUNT").to_pandas(), errors="coerce").dropna()
         qs = [0.05, 0.25, 0.50, 0.75, 0.95, 0.99]
         return pd.DataFrame({
             "percentile": [f"p{int(q*100)}" for q in qs],
@@ -362,6 +424,14 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
     excess = int((stmt.paid_closing_amount > stmt.closing_balance.clip(lower=0) + 0.01).sum())
     rep.check("Settled amount never exceeds closing balance", excess == 0, f"{excess} rows")
 
+    # v7 A1: settlement is cash-consuming, not suffix-cash reuse
+    ok, detail = check_settlement_cash_conservation(stmt, pay)
+    rep.check("Settlement consumes card cash at most once", ok, detail)
+
+    # v7 A2: statement continuity
+    ok, detail = check_statement_continuity(stmt)
+    rep.check("Statement opening equals prior closing", ok, detail)
+
     card_pay = pay[pay.payment_type == "CARD"]
     orphan_pay = int((~card_pay.applied_statement_id.isin(stmt.statement_id)).sum())
     rep.check("Every payment targets an existing statement", orphan_pay == 0, f"orphans={orphan_pay}")
@@ -525,7 +595,10 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
     # date coverage for every fact with a date key
     dd_keys = set(dims["dim_date"].date_key)
     for nm, dfx in [("transaction", tx), ("statement", stmt), ("payment", pay),
-                    ("instalment_schedule", sched)]:
+                    ("payment_allocation", alloc), ("instalment_schedule", sched),
+                    ("instalment_allocation", ialloc), ("credit_limit_event", lim),
+                    ("delinquency_snapshot", delinq), ("fraud_alert", fraud),
+                    ("app_event", ev)]:
         miss = int((~dfx.date_key.isin(dd_keys)).sum())
         rep.check("Date keys covered: " + nm, miss == 0, str(miss) + " rows")
 
@@ -638,6 +711,8 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
         rep.check("Confirmed fraud share 20-55%", 0.20 <= conf <= 0.55, f"{conf:.1%}")
         loss = float(fraud.net_loss.sum())
         rep.check("Net fraud loss reported", loss >= 0, f"${loss:,.0f}")
+        ok, detail = check_fraud_loss_band(fraud, tx)
+        rep.check("Fraud net loss within 3-12 bps", ok, detail)
 
 
     # ---------------- credit policy staging ----------------
@@ -657,6 +732,8 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
         rep.check("60+ DPD delinquent share < 5%", d60 < 0.05, f"{d60:.2%} of snapshots")
     co_ok = int(((acct.account_status == "CHARGED_OFF") & (acct.days_past_due <= 180)).sum())
     rep.check("No charge-off at or below 180 DPD", co_ok == 0, f"{co_ok} accounts")
+    ok, detail = check_chargeoff_incidence(acct)
+    rep.check("Charge-off incidence supports structural claims", ok, detail)
 
     # ---------------- installment plans ----------------
     plan_share = len(plan) / max(1, int((tx.transaction_type == "PURCHASE").sum()))
@@ -693,6 +770,8 @@ def run(dims: dict, facts: dict, raw: dict) -> str:
               f"{cust.credit_score.min()}-{cust.credit_score.max()}")
     rep.check("Income range plausible", float(cust.income_annual.min()) >= 10000,
               f"${cust.income_annual.min():,.0f} - ${cust.income_annual.max():,.0f}")
+    ok, detail = check_accepted_limitations(C.DOC_DIR)
+    rep.check("Accepted limitations recorded", ok, detail)
 
     # ---------------- raw mirror reconciliation ----------------
     def near(a, b, tol=0.05):

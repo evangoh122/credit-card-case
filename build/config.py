@@ -574,3 +574,29 @@ DELINQUENCY_LIFECYCLE_ENABLED = False
 DEFAULT_DPD = 180
 CURE_WINDOW_DAYS = 30
 RECOVERY_TARGET_PCT = (0.15, 0.25)
+
+# --------------------------------------------------------------------------
+# v7 charge-off incidence calibration
+# --------------------------------------------------------------------------
+# v6 produced only 4 charge-offs, which makes any recovery/collection
+# distributional claim meaningless. A small share of accounts is placed on a
+# chronic non-payment path from their first statement so that DPD crosses 180
+# inside the 13-month window. The rate is chosen to yield well above the 400
+# charge-off release gate without changing the overall delinquency mix beyond
+# the documented bands.
+CHARGE_OFF_DISTRESS_SHARE = 0.025
+CHARGE_OFF_MIN_COUNT = 400
+
+# --------------------------------------------------------------------------
+# v7 ML extract settings
+# --------------------------------------------------------------------------
+ML_DIR_NAME = "ml"
+ML_FRAUD_LABEL_NOISE_INDISTINGUISHABLE = 0.15   # true fraud relabelled 0
+ML_FRAUD_LABEL_NOISE_FALSE_FLAG = 0.02          # non-fraud relabelled 1
+ML_OBSERVATION_DATE = dt.date(2026, 3, 31)      # credit/churn feature cut-off
+ML_OUTCOME_END = dt.date(2026, 9, 30)           # label outcome window end
+ML_FRAUD_OOT_START = dt.date(2026, 7, 1)        # final-quarter out-of-time test
+ML_FRAUD_MAX_ROWS = 2_000_000                   # sampled non-fraud rows
+ML_FORECAST_MERCHANTS = 5_000                   # largest merchants by spend
+ML_PR_AUC_MAX = 0.95                            # realistic, not separable
+ML_DRIFT_PSI_MIN = 0.20                         # final-quarter drift must fire

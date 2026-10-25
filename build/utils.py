@@ -137,19 +137,24 @@ for _y in range(C.HISTORY_START.year, C.PERIOD_END.year + 2):
 # Parquet IO
 # --------------------------------------------------------------------------
 def ensure_dirs():
-    for d in (C.DIM_DIR, C.FACT_DIR, C.RAW_DIR, C.DOC_DIR):
+    for d in (C.DIM_DIR, C.FACT_DIR, C.RAW_DIR, C.DOC_DIR, C.OUT / C.ML_DIR_NAME):
         Path(d).mkdir(parents=True, exist_ok=True)
+
+
+def parquet_metadata(table_name: str | None, path: Path) -> dict[str, str]:
+    """Table-level lineage metadata shared by every parquet writer."""
+    return {
+        "dataset": table_name or Path(path).stem,
+        "generator": "synthetic-us-credit-card/1.0",
+        "seed": str(C.SEED),
+        "period": f"{C.PERIOD_START}..{C.PERIOD_END}",
+    }
 
 
 def write_parquet(df: pd.DataFrame, path: Path, table_name: str | None = None):
     """Write with snappy + table-level metadata for downstream lineage."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    md = {
-        b"dataset": (table_name or Path(path).stem).encode(),
-        b"generator": b"synthetic-us-credit-card/1.0",
-        b"seed": str(C.SEED).encode(),
-        b"period": f"{C.PERIOD_START}..{C.PERIOD_END}".encode(),
-    }
+    md = {k.encode(): v.encode() for k, v in parquet_metadata(table_name, path).items()}
     tbl = pa.Table.from_pandas(df, preserve_index=False)
     existing = tbl.schema.metadata or {}
     existing.update(md)
