@@ -125,7 +125,8 @@ def _tx_frame(n=400, seed=1):
         "auth_code": r.choice(["123456", "12", None], n),
         "is_installment_financed": r.choice([True, False], n),
         "merchant_geo_id": r.choice(["G1", None], n),
-        "mcc": r.choice(["5411", "5812"], n), "category": r.choice(["grocery", "dining"], n),
+        "mcc": r.choice(["5411", "5812", None], n),
+        "category": r.choice(["grocery", "dining", None], n),
         "merchant_name": "n", "is_international": r.choice([True, False], n),
         "channel_group": r.choice(["POS", "ECOM"], n),
         "original_transaction_id": r.choice(["T1", "TZ", None], n),
@@ -143,7 +144,7 @@ def _small_dims(df):
                                       "churn_date": [pd.NaT, d("2026-02-15"), pd.NaT]}),
         "dim_merchant": pd.DataFrame({"merchant_id": ["M1", "M2"], "mcc": ["5411", "5999"],
                                       "category": ["grocery", "dining"], "merchant_name": "n",
-                                      "geo_id": ["G1", "G1"], "country_code": ["US", "GB"]}),
+                                      "geo_id": ["G1", None], "country_code": ["US", None]}),
         "dim_card": pd.DataFrame({"card_id": ["K1", "K2"], "expiry_year": [2026, 2027],
                                   "expiry_month": [2, 1], "issue_date": [d("2026-01-10")] * 2,
                                   "replaced_date": [pd.NaT, d("2026-03-01")]}),
@@ -197,11 +198,32 @@ def test_tx_metrics_match_pandas_reference():
     assert M["after_repl"] == int((cm.replaced_date.notna() & (cm.transaction_date > cm.replaced_date)).sum())
     am = tx[["transaction_date", "account_id"]].merge(dims["dim_account"][["account_id", "closed_date"]], on="account_id", how="left")
     assert M["after_close"] == int((am.closed_date.notna() & (am.transaction_date > am.closed_date)).sum())
-    mm = tx[["merchant_id", "mcc", "merchant_geo_id", "is_international"]].merge(
-        dims["dim_merchant"][["merchant_id", "mcc", "geo_id", "country_code"]], on="merchant_id",
-        how="left", suffixes=("_tx", "_m"))
-    ok_m = mm[mm.merchant_id.notna()]
-    assert M["bad_mcc"] >= int((ok_m.mcc_tx != ok_m.mcc_m).sum())
+    assert M["fk_customer"] == int((~tx.customer_id.isin({"C1", "C2", "C3"})).sum())
+    assert M["fk_merchant"] == int((~tx.merchant_id.isin({"M1", "M2"})).sum())  # nulls are orphans
+    assert M["null_geo"] == int(tx.merchant_geo_id.isna().sum())
+    assert M["approved"] == int((tx.status == "APPROVED").sum())
+    assert M["purchases"] == int((tx.transaction_type == "PURCHASE").sum())
+    assert M["refunds"] == int((tx.transaction_type == "REFUND").sum())
+    assert M["financed_sum"] == pytest.approx(float(tx[tx.is_installment_financed].amount_usd.sum()))
+    ch = dims["dim_customer"].dropna(subset=["churn_date"])
+    cm2 = tx[["transaction_date", "customer_id"]].merge(ch[["customer_id", "churn_date"]], on="customer_id")
+    assert M["after_churn"] == int((cm2.transaction_date > cm2.churn_date).sum())
+    # exact pandas expressions from the former validation.run (null rows NOT filtered)
+    mm = tx[["merchant_id", "mcc", "category", "merchant_name", "merchant_geo_id",
+             "is_international"]].merge(
+        dims["dim_merchant"][["merchant_id", "mcc", "category", "merchant_name", "geo_id",
+                              "country_code"]],
+        on="merchant_id", how="left", suffixes=("_tx", "_m"))
+    ref_bad = {
+        "bad_mcc": int((mm.mcc_tx != mm.mcc_m).sum()),
+        "bad_cat": int((mm.category_tx != mm.category_m).sum()),
+        "bad_geo": int((mm.merchant_geo_id != mm.geo_id).sum()),
+        "bad_intl": int((mm.is_international != (mm.country_code != "US")).sum()),
+    }
+    assert all(v > 0 for v in ref_bad.values())  # fixture really exercises nulls
+    assert ref_bad["bad_geo"] > int(((mm.merchant_geo_id != mm.geo_id)
+                                     & mm.merchant_geo_id.notna() & mm.geo_id.notna()).sum())
+    assert {k: M[k] for k in ref_bad} == ref_bad
     monthly = tx.assign(m=tx.transaction_date.dt.strftime("%Y-%m")).groupby("m").agg(
         n=("transaction_id", "size"), spend=("amount_usd", lambda s: s.clip(lower=0).sum()))
     pd.testing.assert_frame_equal(M["monthly"], monthly, check_dtype=False)

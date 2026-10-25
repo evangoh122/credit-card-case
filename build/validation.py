@@ -318,12 +318,16 @@ def tx_metrics(txl: pl.LazyFrame, *, dims: dict, facts: dict, dd_keys: set) -> d
     mc = _small(merch, ["merchant_id", "mcc", "category", "merchant_name", "geo_id", "country_code"])
     mm = txl.select("merchant_id", "mcc", "category", "merchant_name", "merchant_geo_id",
                     "is_international").join(mc, on="merchant_id", how="left", suffix="_m")
+    def differs(a: pl.Expr, b: pl.Expr) -> pl.Expr:
+        # pandas `!=`: a null on either side (None/NaN) counts as a mismatch
+        return (a != b).fill_null(True)
+
     bad = mm.select(
-        pl.col("mcc").ne_missing(pl.col("mcc_m")).sum().alias("bad_mcc"),
-        pl.col("category").ne_missing(pl.col("category_m")).sum().alias("bad_cat"),
-        pl.col("merchant_geo_id").ne_missing(pl.col("geo_id")).sum().alias("bad_geo"),
-        pl.col("is_international").ne_missing(
-            pl.col("country_code").ne_missing(pl.lit("US"))).sum().alias("bad_intl"),
+        differs(pl.col("mcc"), pl.col("mcc_m")).sum().alias("bad_mcc"),
+        differs(pl.col("category"), pl.col("category_m")).sum().alias("bad_cat"),
+        differs(pl.col("merchant_geo_id"), pl.col("geo_id")).sum().alias("bad_geo"),
+        differs(pl.col("is_international"),
+                (pl.col("country_code") != "US").fill_null(True)).sum().alias("bad_intl"),
     ).collect(engine="streaming").row(0, named=True)
     m.update(bad)
 
