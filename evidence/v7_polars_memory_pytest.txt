@@ -1,0 +1,8 @@
+tests/test_v6_regressions.py::RawConnectivityTests::test_voucher_activity_uses_parent_voucher_id
+tests/test_v6_regressions.py::RawConnectivityTests::test_voucher_activity_uses_parent_voucher_id
+tests/test_v6_regressions.py::RawConnectivityTests::test_voucher_activity_uses_parent_voucher_id
+  /mnt/d/Get shit Done/Data Science/DS Work/Credit Card Case/build/raw_mirror.py:443: DeprecationWarning: The 'generic' unit for NumPy timedelta is deprecated, and will raise an error in the future. This includes implicit conversion of bare integers (e.g. `+ 1`). Please use a specific unit instead.
+    LAST_UPDATED_DATE=str(base + pd.Timedelta(seconds=delta)),
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+30 passed, 10 warnings in 17.45s

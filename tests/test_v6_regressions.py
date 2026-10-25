@@ -15,7 +15,10 @@ from build.facts import (
 
 
 class SettlementTests(unittest.TestCase):
-    def test_all_later_card_cash_settles_closing_balances(self):
+    def test_card_cash_is_consumed_at_most_once(self):
+        # v6 regression, rewritten for the cash-consuming settlement rule:
+        # the $150 of card cash settles $100 of the first closing and only the
+        # remaining $50 of the second. It must never fund $200 of settlement.
         stmts = [
             {"statement_date": dt.date(2026, 1, 1), "closing_balance": 100.0},
             {"statement_date": dt.date(2026, 2, 1), "closing_balance": 200.0},
@@ -26,10 +29,9 @@ class SettlementTests(unittest.TestCase):
             (dt.date(2026, 1, 15), 50.0),
             (dt.date(2026, 3, 15), 100.0), # later than the next statement cycle
         ]
-        self.assertEqual(
-            _settled_closing_amounts(stmts, payments),
-            [100.0, 100.0, 0.0],
-        )
+        settled = _settled_closing_amounts(stmts, payments)
+        self.assertEqual(settled, [100.0, 50.0, 0.0])
+        self.assertLessEqual(sum(settled), 150.0)
 
     def test_no_later_cash_leaves_closing_unsettled(self):
         stmts = [{"statement_date": dt.date(2026, 2, 1), "closing_balance": 80.0}]

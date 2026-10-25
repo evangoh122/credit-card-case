@@ -129,8 +129,11 @@ python -m build.run_all       # postprocess + final validation run inside this c
 The build exits non-zero if any validation check fails, and writes
 `release_manifest.json` plus `RELEASE_OK` or `RELEASE_FAILED`.
 
-Requirements: Python 3.14, pandas 2.3.3, numpy 2.5.4, pyarrow 25.0.1
-(see `pyproject.toml`). Runtime ≈ 55 minutes for 50k customers.
+Requirements: Python 3.14, pandas 2.3.3, numpy 2.5.4, pyarrow 25.0.1,
+polars 2.0.0 (see `pyproject.toml`). Postprocessing and the ML extracts read the
+470 MB `fact_transaction.parquet` with Polars (lazy scan / streaming sink) rather
+than loading it whole into pandas, which OOM'd v7; `run_all` also frees the
+in-memory tables after writing them. Regression: `tests/test_postprocess_polars.py`. Runtime ≈ 55 minutes for 50k customers.
 
 ---
 

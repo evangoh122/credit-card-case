@@ -1435,13 +1435,37 @@ def _waterfall(stmts: list[dict], amount: float, pay_date):
 
 
 def _settled_closing_amounts(stmts: list[dict], card_payments: list[tuple]) -> list[float]:
-    """Settle each positive closing balance with all later card cash."""
-    settled = []
-    for s in stmts:
-        later_cash = sum(amount for pay_date, amount in card_payments
-                         if pay_date > s["statement_date"])
-        settled.append(round(min(max(s["closing_balance"], 0.0), later_cash), 2))
-    return settled
+    """Settle closing balances with cash that is consumed at most once.
+
+    Payments are walked in chronological order and attributed to the oldest
+    statement whose positive closing balance is still open. A dollar of card
+    cash can settle at most one statement, so for every account
+    ``sum(paid_closing_amount) <= sum(card cash)``. This replaces the v6
+    behaviour, which reused the whole later-payment suffix for every earlier
+    statement and therefore over-reported settlement.
+    """
+    payments = sorted(((pd.Timestamp(d), float(a)) for d, a in card_payments),
+                      key=lambda x: x[0])
+    consumed = [0.0] * len(payments)
+    settled_by_stmt: dict[int, float] = {}
+    for s in sorted(stmts, key=lambda x: x["statement_date"]):
+        cut = pd.Timestamp(s["statement_date"])
+        need = max(float(s["closing_balance"]), 0.0)
+        settled = 0.0
+        for i, (pay_date, amount) in enumerate(payments):
+            if need <= 0.005:
+                break
+            if pay_date <= cut:
+                continue
+            available = amount - consumed[i]
+            if available <= 0.005:
+                continue
+            take = min(available, need)
+            consumed[i] += take
+            settled += take
+            need -= take
+        settled_by_stmt[id(s)] = round(settled, 2)
+    return [settled_by_stmt[id(s)] for s in stmts]
 
 
 def _final_dpd(stmts: list[dict], as_of) -> int:
@@ -1619,6 +1643,17 @@ def simulate_v2(dims: dict) -> dict:
         p_min = float(np.clip(rng.normal(0.16, 0.04), 0.06, 0.28))
         p_part = float(np.clip(rng.normal(0.12, 0.04), 0.04, 0.22))
         p_late = float(np.clip(rng.normal(0.07, 0.03), 0.01, 0.15))
+
+        # v7 charge-off incidence: a small share of early-vintage accounts is
+        # on a chronic non-payment path from the first statement. Without it
+        # the book only produces 4 charge-offs, which cannot support any
+        # distributional recovery/collection statement. Selection is
+        # deterministic from the simulator RNG stream and does not depend on
+        # the realised balances.
+        distress = bool(
+            open_date <= C.PERIOD_END - dt.timedelta(days=230)
+            and rng.random() < C.CHARGE_OFF_DISTRESS_SHARE
+        )
 
         stmt_dates = []
         for y, m in _months(open_date, eff_end):
@@ -1834,7 +1869,11 @@ def simulate_v2(dims: dict) -> dict:
             fees_total += fees
 
             # -------- schedule the payment --------
-            if closing > 0 and due_date <= C.PAYMENT_HORIZON:
+            if distress:
+                # chronic non-payment: no payment is scheduled, so DPD accrues
+                # to the 180+ charge-off threshold inside the observation window
+                pass
+            elif closing > 0 and due_date <= C.PAYMENT_HORIZON:
                 r = rng.random()
                 amt = 0.0
                 pay_date = due_date - dt.timedelta(days=int(rng.integers(2, 18)))
