@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import polars as pl
 
 from . import config as C
 
@@ -300,17 +301,47 @@ def _describe(table: str, col: str) -> str:
     return ""
 
 
-def build(tables: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, str]:
+def table_shape(df) -> tuple[int, int]:
+    """(rows, columns) for a DataFrame or a LazyFrame (row count via a lazy scan)."""
+    if isinstance(df, pl.LazyFrame):
+        return (int(df.select(pl.len()).collect().item()), len(df.collect_schema().names()))
+    return len(df), len(df.columns)
+
+
+def column_stats(df):
+    """Yield (column, dtype, null_count, row_count, distinct) for each column.
+
+    A LazyFrame is profiled one column at a time so the table is never
+    materialised; dtypes are reported as the pandas dtypes a full load gives.
+    """
+    if isinstance(df, pl.LazyFrame):
+        dtypes = df.head(0).collect().to_pandas().dtypes
+        rows = int(df.select(pl.len()).collect().item())
+        for c in df.collect_schema().names():
+            nulls, nuniq = df.select(
+                pl.col(c).null_count().alias("n"), pl.col(c).n_unique().alias("u")
+            ).collect(engine="streaming").row(0)
+            yield c, str(dtypes[c]), int(nulls), rows, int(nuniq) - (1 if nulls else 0)
+        return
+    for c in df.columns:
+        yield (c, str(df[c].dtype), int(df[c].isna().sum()), len(df),
+               int(df[c].nunique(dropna=True)))
+
+
+def build(tables: dict[str, pd.DataFrame | pl.LazyFrame]) -> tuple[pd.DataFrame, str]:
     rows = []
+    shapes = {}
     for name, df in tables.items():
-        for c in df.columns:
+        shapes[name] = table_shape(df)
+        for c, dtype, nulls, n, distinct in column_stats(df):
+            null_frac = nulls / n if n else float("nan")
             rows.append(dict(
                 table=name,
                 column=c,
-                dtype=str(df[c].dtype),
-                nullable=bool(df[c].isna().any()),
-                null_pct=round(float(df[c].isna().mean() * 100), 2),
-                distinct=int(df[c].nunique(dropna=True)),
+                dtype=dtype,
+                nullable=bool(nulls),
+                null_pct=round(float(null_frac * 100), 2),
+                distinct=distinct,
                 description=_describe(name, c),
             ))
     dd = pd.DataFrame(rows)
@@ -334,10 +365,10 @@ def build(tables: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, str]:
             continue
         lines += [f"## {layer} tables", ""]
         for t in subset:
-            df = tables[t]
+            n_rows, n_cols = shapes[t]
             lines += [f"### `{t}`", "",
-                      f"- Rows: **{len(df):,}**",
-                      f"- Columns: **{len(df.columns)}**"]
+                      f"- Rows: **{n_rows:,}**",
+                      f"- Columns: **{n_cols}**"]
             if t in FACT_NOTES:
                 lines.append(f"- Grain: {FACT_NOTES[t].split(': ', 1)[-1]}")
             lines += ["", "| Column | Type | Null % | Distinct | Description |", "|---|---|---|---|---|"]
