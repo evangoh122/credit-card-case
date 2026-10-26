@@ -259,6 +259,84 @@ def test_engagement_rejects_null_time_zone():
         engagement_features(events, dim, date(2026, 10, 3))
 
 
+def test_rfm_validates_unknown_customers_before_purchase_filtering():
+    transactions = pl.concat(
+        [
+            _transactions().head(1),
+            pl.DataFrame(
+                {
+                    "customer_id": ["ghost"],
+                    "txn_type": ["repayment"],
+                    "amount": [5.0],
+                    "event_ts_utc": [datetime(2026, 10, 20, 15, tzinfo=UTC)],
+                }
+            ),
+        ]
+    )
+    with pytest.raises(ValueError, match="fact_transactions customer_ids missing"):
+        rfm_snapshot(_customers(), transactions, date(2026, 11, 1), WINDOWS)
+
+
+def test_gold_entry_points_reject_null_customer_ids():
+    transactions = pl.DataFrame(
+        {
+            "customer_id": [None],
+            "txn_type": ["purchase"],
+            "amount": [5.0],
+            "event_ts_utc": [datetime(2026, 10, 20, 15, tzinfo=UTC)],
+        },
+        schema_overrides={"customer_id": pl.String},
+    )
+    with pytest.raises(ValueError, match="fact_transactions customer_id must not contain nulls"):
+        rfm_snapshot(_customers(), transactions, date(2026, 11, 1), WINDOWS)
+
+    events = pl.DataFrame(
+        {
+            "customer_id": [None],
+            "event_type": ["app_open"],
+            "event_ts_utc": [datetime(2026, 10, 20, 15, tzinfo=UTC)],
+        },
+        schema_overrides={"customer_id": pl.String},
+    )
+    with pytest.raises(ValueError, match="fact_events customer_id must not contain nulls"):
+        engagement_features(events, _customers(), date(2026, 10, 20))
+
+    late = events.with_columns(
+        pl.lit(datetime(2026, 11, 2, tzinfo=UTC)).alias("loaded_at")
+    ).with_columns(pl.col("loaded_at").cast(pl.Datetime("us", "UTC")))
+    with pytest.raises(ValueError, match="events customer_id must not contain nulls"):
+        count_late_events(late, _customers(), date(2026, 11, 1), date(2026, 11, 2))
+
+    null_dim = _customers().with_columns(pl.lit(None, dtype=pl.String).alias("customer_id"))
+    with pytest.raises(ValueError, match="dim_customer customer_id must not contain nulls"):
+        engagement_features(
+            events.with_columns(pl.lit("a").alias("customer_id")),
+            null_dim,
+            date(2026, 10, 20),
+        )
+
+
+def test_gold_features_accept_empty_fact_frames():
+    dim = _customers()
+    transactions = _transactions().clear()
+    result = rfm_snapshot(dim, transactions, date(2026, 11, 1), WINDOWS)
+    assert result.height == 2
+    assert (result["frequency"] == 0).all()
+    assert (result["monetary"] == 0.0).all()
+
+    events = pl.DataFrame(
+        schema={
+            "customer_id": pl.String,
+            "event_type": pl.String,
+            "event_ts_utc": pl.Datetime("us", "UTC"),
+            "loaded_at": pl.Datetime("us", "UTC"),
+        }
+    )
+    engagement = engagement_features(events, dim, date(2026, 11, 1))
+    assert engagement.height == 0
+    assert count_late_events(events, dim, date(2026, 11, 1), date(2026, 11, 2)) == 0
+
+
 def _segment_features() -> pl.DataFrame:
     return pl.DataFrame(
         {
