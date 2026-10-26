@@ -1,6 +1,6 @@
 > **SUPERSEDED - historical record only.**
 > This document describes an earlier candidate and is retained for audit.
-> The current release record is `feedback_v6.md` and `hand_off_v6.md`.
+> The current release record is `docs/archive/feedback_v6.md` and `docs/archive/hand_off_v6.md`.
 
 # Handoff for independent review — v2
 

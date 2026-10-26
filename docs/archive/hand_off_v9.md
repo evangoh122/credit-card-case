@@ -1,21 +1,21 @@
 # Hand-off v9 — session plan
 
 > **STATUS: PLANNED — NO v9 ARTIFACT EXISTS.**
-> This hand-off was created after review of `hand_off_v8.md`. It does not claim
+> This hand-off was created after review of `docs/archive/hand_off_v8.md`. It does not claim
 > that v7, v8, or v9 has been built or released.
 
 **Hand-off author / reviewer:** Codex  
 **Reviewing model:** OpenAI Codex (GPT-5 family; exact provider model ID is not exposed in this session)  
 **Date:** 2026-10-25, Asia/Singapore  
-**Matching review:** `feedback_v8.md`
+**Matching review:** `docs/archive/feedback_v8.md`
 
 ## 1. Current state
 
 | Version | State | Evidence |
 |---|---|---|
-| v6 | latest built artifact; built-in gate reported `released: true`, but current directory integrity and settlement semantics remain disputed | v6 manifest, `feedback_v7.md`, `feedback_v8.md` |
-| v7 | planned; no artifact | `hand_off_v7.md` |
-| v8 | planned; no artifact | `hand_off_v8.md` |
+| v6 | latest built artifact; built-in gate reported `released: true`, but current directory integrity and settlement semantics remain disputed | v6 manifest, `docs/archive/feedback_v7.md`, `docs/archive/feedback_v8.md` |
+| v7 | planned; no artifact | `docs/archive/hand_off_v7.md` |
+| v8 | planned; no artifact | `docs/archive/hand_off_v8.md` |
 | v9 | planned; no artifact | this document |
 
 The current v6 directory has two documentation files whose present SHA-256 values
@@ -26,7 +26,7 @@ do not match the release manifest: `data_dictionary.csv` and
 
 | Change | Evidence tier |
 |---|---|
-| Reviewed the v8 planning hand-off and recorded its blockers | code/document inspection in `feedback_v8.md` |
+| Reviewed the v8 planning hand-off and recorded its blockers | code/document inspection in `docs/archive/feedback_v8.md` |
 | Recomputed current v6 documentation hashes; two mismatches remain | direct measurement |
 | Executed the current regression suite: 8 passed, 8 warnings | test |
 | Created this next-numbered planned hand-off | documentation only |
@@ -80,7 +80,7 @@ No v9 files exist yet. A future v9 candidate must provide:
 - `feedback_v9.md` with actual reviewer/model attribution; and
 - this hand-off updated with measurements from the v9 artifact.
 
-Proposed wrapper invocation, after the wrapper satisfies `feedback_v8.md`:
+Proposed wrapper invocation, after the wrapper satisfies `docs/archive/feedback_v8.md`:
 
 ```powershell
 .\run_release.ps1 -Version 9

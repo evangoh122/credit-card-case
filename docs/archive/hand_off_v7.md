@@ -20,9 +20,9 @@ state and the plan; the feedback file records independent review.
 |---|---|
 | Current release | **v6** (`credit_card_data_v6/`) |
 | Gate | exit 0 · 143 PASS / 17 INFO / 0 FAIL · `released: true` |
-| Independent checks | 24 / 24 at zero (see `feedback_v6.md` §3) |
-| Review record | `feedback_v6.md` — provenance, 29/29 prior findings validated |
-| Superseded | v3, v4, v5; `HANDOFF_FOR_REVIEW.md` and `v5_review_addendum.md` are bannered |
+| Independent checks | 24 / 24 at zero (see `docs/archive/feedback_v6.md` §3) |
+| Review record | `docs/archive/feedback_v6.md` — provenance, 29/29 prior findings validated |
+| Superseded | v3, v4, v5; `docs/archive/HANDOFF_FOR_REVIEW.md` and `docs/archive/v5_review_addendum.md` are bannered |
 | Model that produced v6 | DeepSeek V4.1 Flash 1017 (`deepseek` / `deepseek-flash`) |
 
 ### Session history
@@ -38,9 +38,9 @@ state and the plan; the feedback file records independent review.
 
 | Claim | Evidence tier |
 |---|---|
-| v6 gate: exit 0, 143 PASS / 0 FAIL, `released: true` | **measurement** — `release_manifest.json`, `build_v6_log.txt` |
-| 24 independent checks at zero | **measurement** — Parquet read directly, script in `feedback_v6.md` §3 |
-| 29/29 prior findings valid | **measurement + code inspection** — `feedback_v6.md` §2 |
+| v6 gate: exit 0, 143 PASS / 0 FAIL, `released: true` | **measurement** — `release_manifest.json`, the v6 build log (deleted from the repo; see git history) |
+| 24 independent checks at zero | **measurement** — Parquet read directly, script in `docs/archive/feedback_v6.md` §3 |
+| 29/29 prior findings valid | **measurement + code inspection** — `docs/archive/feedback_v6.md` §2 |
 | v7 scope, acceptance tests, non-regression contract | **proposal** — nothing implemented, no v7 artifact |
 
 No figure in this document is carried over from a different version.
@@ -49,9 +49,9 @@ No figure in this document is carried over from a different version.
 
 ## 2. Mandatory reading before starting v7
 
-1. `feedback_v6.md` — what was verified and what was accepted as limitation.
-2. `hand_off_v6.md` §5 — the 11 ledger identities that must not regress.
-3. `hand_off_v6.md` §12 — the disclosed limitations this version should reduce.
+1. `docs/archive/feedback_v6.md` — what was verified and what was accepted as limitation.
+2. `docs/archive/hand_off_v6.md` §5 — the 11 ledger identities that must not regress.
+3. `docs/archive/hand_off_v6.md` §12 — the disclosed limitations this version should reduce.
 4. `credit_card_data_v6/release_manifest.json` — hashes and gate status.
 
 ---
@@ -148,11 +148,11 @@ python -m build.refresh_docs     # regenerate docs from the released Parquet
 
 1. Build into a **new directory**; never patch a prior release in place.
 2. Confirm exit code `0`, `release_manifest.json` → `"released": true`, `RELEASE_OK`.
-3. Re-run the independent script in `feedback_v6.md` §3 against v7.
-4. Write `feedback_v7.md`: dataset version, reviewer name, model name and
+3. Re-run the independent script in `docs/archive/feedback_v6.md` §3 against v7.
+4. Write `docs/archive/feedback_v7.md`: dataset version, reviewer name, model name and
    provider/model ID, date/timezone, artifacts, evidence basis, verdict, findings.
 5. Append, never overwrite, prior review sections.
-6. Update `hand_off_v7.md` from *planned* to *released* only when steps 1–3 pass.
+6. Update `docs/archive/hand_off_v7.md` from *planned* to *released* only when steps 1–3 pass.
 
 ---
 
@@ -174,8 +174,8 @@ python -m build.refresh_docs     # regenerate docs from the released Parquet
 - [ ] build exits 0 with `released: true`
 - [ ] every §4 identity still zero
 - [ ] new acceptance tests pass on the released artifact
-- [ ] `feedback_v7.md` written with model provenance and evidence basis
-- [ ] `hand_off_v7.md` rewritten from *planned* to *released* with measured numbers
+- [ ] `docs/archive/feedback_v7.md` written with model provenance and evidence basis
+- [ ] `docs/archive/hand_off_v7.md` rewritten from *planned* to *released* with measured numbers
 - [ ] README and REVIEW_GUIDE point at v7
 - [ ] prior hand-offs and feedback retained, bannered if superseded
 

@@ -3,7 +3,7 @@
 **Reviewer:** Codex  
 **Review status:** provisional rejection / release candidate only  
 **Review time:** 2026-10-25, approximately 13:13 Asia/Singapore  
-**Scope:** `v5_review_addendum.md`, current generator and validator code, and the live v5 build state  
+**Scope:** `docs/archive/v5_review_addendum.md`, current generator and validator code, and the live v5 build state  
 **Modification policy:** no generator, data, or existing documentation was modified during review
 
 At review time, v5 had completed fact generation and was still building the raw
@@ -189,7 +189,7 @@ The final release validator should independently check all of the following:
 
 ### Premature status claims
 
-`v5_review_addendum.md` was written while the build was still running. It should not
+`docs/archive/v5_review_addendum.md` was written while the build was still running. It should not
 state that v5 supersedes v4 or that fixes are complete until a finished artifact has
 passed independent validation.
 
@@ -299,7 +299,7 @@ must be re-measured on `credit_card_data_v5/`. No generator or data was modified
    `pay.applied_statement_id` names an existing statement — in v4, **6,946 payments**
    carried an `applied_statement_id` that was not among their own allocation rows.
 
-7. **Documentation arithmetic:** `HANDOFF_FOR_REVIEW.md` §1 reports "Total rows
+7. **Documentation arithmetic:** `docs/archive/HANDOFF_FOR_REVIEW.md` §1 reports "Total rows
    27,304,639" where its own table sums to 21,022,560 (the total silently includes
    19 raw tables); `REVIEW_GUIDE.md` still reads "8 dimensions, 9 facts"; `README.md`
    cites an SSN "900–999 area range" although no SSN column exists (only
@@ -327,7 +327,7 @@ both statements. `PAID_FULL` then trusts this derived value at
 `build/facts.py:1361-1362`.
 
 This defeats the central v4 shortfall repair. Checking `paid_closing_amount`
-against the same derived field, as proposed in `v5_review_addendum.md:134-136`,
+against the same derived field, as proposed in `docs/archive/v5_review_addendum.md:134-136`,
 cannot detect it. Settlement must be reconstructed independently from payment
 allocations and tested with multi-statement cases, including payments made after
 later statement cuts.

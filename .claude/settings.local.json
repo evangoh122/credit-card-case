@@ -1,8 +1,6 @@
 {
   "permissions": {
     "allow": [
-      "Bash(iconv -f UTF-16LE -t UTF-8 build_v6_log.txt)",
-      "Bash(PowerShell -c \"Get-Content build_v6_log.txt -Tail 60\")",
       "Bash(tasklist)"
     ]
   }

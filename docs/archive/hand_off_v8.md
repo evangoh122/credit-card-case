@@ -10,7 +10,7 @@
 **Date:** 2026-10-25 (build-host local time; release timestamps are UTC)
 **Evidence basis:** this document contains **no v8 measurements**. Every v6 figure
 quoted below is taken from `credit_card_data_v6/release_manifest.json` and
-`feedback_v6.md` §3.
+`docs/archive/feedback_v6.md` §3.
 
 ---
 
@@ -18,8 +18,8 @@ quoted below is taken from `credit_card_data_v6/release_manifest.json` and
 
 | Version | Status | Evidence |
 |---|---|---|
-| v6 | **released (gate); rejected in independent review on settlement** | exit 0 · 143 PASS / 17 INFO / 0 FAIL · `released: true` · 24/24 independent checks at zero, but that suite has **no settlement cash-conservation check** — see `feedback_v7.md` P1 |
-| v7 | **planned** — no artifact | `hand_off_v7.md` |
+| v6 | **released (gate); rejected in independent review on settlement** | exit 0 · 143 PASS / 17 INFO / 0 FAIL · `released: true` · 24/24 independent checks at zero, but that suite has **no settlement cash-conservation check** — see `docs/archive/feedback_v7.md` P1 |
+| v7 | **planned** — no artifact | `docs/archive/hand_off_v7.md` |
 | v8 | **planned** — no artifact | this document |
 
 v7 and v8 are **both unrealised**. v7 defines ledger-completeness scope; v8 adds
@@ -37,7 +37,7 @@ generating process.
 
 | # | Item | Acceptance test |
 |---|---|---|
-| S | **Settlement cash conservation** — release blocker carried from the v6 reviews (`feedback_v7.md` P1); must ship before E–H | each payment consumed at most once; per-account `sum(paid_closing_amount) <= card cash`; settlement regression test rewritten (the v6 test encodes $200 of settlement from $150 of cash); account-level conservation check in the release gate |
+| S | **Settlement cash conservation** — release blocker carried from the v6 reviews (`docs/archive/feedback_v7.md` P1); must ship before E–H | each payment consumed at most once; per-account `sum(paid_closing_amount) <= card cash`; settlement regression test rewritten (the v6 test encodes $200 of settlement from $150 of cash); account-level conservation check in the release gate |
 | A | `RETURNED` payments | returned cash reverses its allocation, restores balance, charges a fee; delinquency recomputes; no negative cash |
 | B | Daily delinquency events | transitions fall between statement dates; roll/cure counts reconcile to snapshots |
 | C | Collections and recovery | `sum(recovery) <= balance_at_chargeoff`; cumulative recovery 15–25% over 24 months; never before charge-off |
@@ -73,13 +73,13 @@ transaction.is_international = (merchant.country_code != "US")
 opening(i+1) = closing(i)
 ```
 
-> **Corrected 2026-10-25 (MiMo, `feedback_v7.md` P2):** the line above originally
-> read `opening(i+1) = closing(i) - payments(i+1)`, copied from `hand_off_v6.md`
+> **Corrected 2026-10-25 (MiMo, `docs/archive/feedback_v7.md` P2):** the line above originally
+> read `opening(i+1) = closing(i) - payments(i+1)`, copied from `docs/archive/hand_off_v6.md`
 > §5. That form is falsified by two independent measurements: `opening(i+1) =
 > closing(i)` holds exactly ($0.00 across 530,594 v6 statement rolls; also
-> `feedback_v6.md` §3 check 21), while the old form shows max residual $80,026.51.
+> `docs/archive/feedback_v6.md` §3 check 21), while the old form shows max residual $80,026.51.
 
-Once the settlement fix lands (`feedback_v7.md` P1), the contract must also
+Once the settlement fix lands (`docs/archive/feedback_v7.md` P1), the contract must also
 include, measured per account: `sum(paid_closing_amount) <= card cash`, each
 payment consumed at most once. Note the `PAID_FULL` row is definitional
 (`build/facts.py:1436`), not an independent invariant.
@@ -93,7 +93,7 @@ A regression blocks release. Do not relax a check to pass.
 
 ## 4. Review contract for v8
 
-`feedback_v8.md` is written **only after** a completed artifact exists.
+`docs/archive/feedback_v8.md` is written **only after** a completed artifact exists.
 
 ### 4.1 Required before anyone may call v8 released
 
@@ -108,7 +108,7 @@ A regression blocks release. Do not relax a check to pass.
 
 ### 4.2 Feedback file requirements
 
-`feedback_v8.md` must record, per `AGENTS.md`:
+`docs/archive/feedback_v8.md` must record, per `AGENTS.md`:
 
 - dataset/release version;
 - reviewer name and exact model identity (model name plus provider/model ID);
@@ -129,7 +129,7 @@ verbatim and never shortened.
 | Codex | *(to be recorded by the reviewer)* | lifecycle, schema, release process |
 | Kimi | *(to be recorded by the reviewer)* | settlement, raw connectivity, validator gaps |
 
-The first reviewer to open `feedback_v8.md` owns the provenance header. Later
+The first reviewer to open `docs/archive/feedback_v8.md` owns the provenance header. Later
 reviewers append; they do not edit it.
 
 ---
@@ -142,7 +142,7 @@ reviewers append; they do not edit it.
 ```
 
 `run_v8.ps1` builds into `credit_card_data_v8/`, and only if the gate passes does
-it create `feedback_v8.md` with a provenance header and a **"no independent review
+it create `docs/archive/feedback_v8.md` with a provenance header and a **"no independent review
 performed yet"** marker. It never invents a verdict.
 
 Manual equivalent:
@@ -162,9 +162,9 @@ python -m build.refresh_docs     # regenerate docs from the released Parquet
 - [ ] build exits 0, `released: true`
 - [ ] §3 identities all zero on the v8 artifact
 - [ ] E–H acceptance tests pass
-- [ ] `feedback_v8.md` written with model provenance and evidence basis
+- [ ] `docs/archive/feedback_v8.md` written with model provenance and evidence basis
 - [ ] this document rewritten from *planned* to *released* with measured numbers
-- [ ] README, REVIEW_GUIDE and `hand_off_v7.md` point forward correctly
+- [ ] README, REVIEW_GUIDE and `docs/archive/hand_off_v7.md` point forward correctly
 - [ ] v6 and v7 documents retained; superseded ones bannered, never deleted
 
 ---
@@ -181,17 +181,17 @@ plan, and it is labelled as one.*
 `mimo-v2.6-pro`)
 **Date:** 2026-10-25, ~21:55 +08:00 (Asia/Singapore)
 
-Appended after reviewing `hand_off_v7.md` (record: `feedback_v7.md`), per the
+Appended after reviewing `docs/archive/hand_off_v7.md` (record: `docs/archive/feedback_v7.md`), per the
 AGENTS.md forward-hand-off rule. The hand-off author remains DeepSeek V4.1 Flash
 1017; the following edits were made by the reviewer and are attributed here so
 the change history is auditable:
 
 | Edit | Reason |
 |---|---|
-| §3 contract: `opening(i+1) = closing(i) - payments(i+1)` → `opening(i+1) = closing(i)`, with measurement citation | the old form is falsified — `feedback_v7.md` P2 |
-| §2.1: added scope item **S** (settlement cash conservation) | release blocker carried from the v6 reviews — `feedback_v7.md` P1 |
-| §1 v6 row: released (gate) / rejected in independent review; caveat on the 24/24 suite | the suite omits settlement cash conservation — `feedback_v7.md` M2 |
-| §3: noted the `PAID_FULL` row is definitional; named the conservation invariant to add post-fix | `feedback_v7.md` M1 |
+| §3 contract: `opening(i+1) = closing(i) - payments(i+1)` → `opening(i+1) = closing(i)`, with measurement citation | the old form is falsified — `docs/archive/feedback_v7.md` P2 |
+| §2.1: added scope item **S** (settlement cash conservation) | release blocker carried from the v6 reviews — `docs/archive/feedback_v7.md` P1 |
+| §1 v6 row: released (gate) / rejected in independent review; caveat on the 24/24 suite | the suite omits settlement cash conservation — `docs/archive/feedback_v7.md` M2 |
+| §3: noted the `PAID_FULL` row is definitional; named the conservation invariant to add post-fix | `docs/archive/feedback_v7.md` M1 |
 
 No build, manifest, measurement, or release status was invented; v7 and v8 both
 remain `planned`.

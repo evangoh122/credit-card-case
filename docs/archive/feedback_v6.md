@@ -10,7 +10,7 @@
 | Provider / model ID | `deepseek` / `deepseek-flash` |
 | Review date | 2026-10-25 (build-host local time; all release timestamps in `release_manifest.json` are UTC) |
 | Review type | Independent measurement of the completed release plus code inspection |
-| Artifacts inspected | `credit_card_data_v6/` (38 Parquet tables), `release_manifest.json`, `docs/validation_report.md`, `docs/data_dictionary.md`, `build_v6_log.txt`, generator source in `build/` |
+| Artifacts inspected | `credit_card_data_v6/` (38 Parquet tables), `release_manifest.json`, `docs/validation_report.md`, `docs/data_dictionary.md`, the v6 build log (deleted from the repo; see git history), generator source in `build/` |
 | Evidence basis | **Three separate tiers, never merged:** (a) independent Parquet measurements using a script that does **not** import `build/`; (b) static code inspection; (c) build log and release manifest. A built-in `PASS` is not accepted as verification of anything. |
 | Modification policy | No generator, data or documentation was modified during this review. Documentation-only corrections made before this record are listed in §6. |
 
@@ -31,7 +31,7 @@
 | `RELEASE_FAILED` marker | absent |
 | Independent measurement failures | **0** (24 checks, §3) |
 
-The build is suitable for the analytical uses described in `hand_off_v6.md` §12,
+The build is suitable for the analytical uses described in `docs/archive/hand_off_v6.md` §12,
 subject to the accepted limitations in §5. It is **not** suitable for causal
 inference, ML benchmarking without hardening, or installment-profitability work
 that requires `RETURNED` payment behaviour.
@@ -57,7 +57,7 @@ data.
 | Raw voucher/activity independently sampled | **Valid** | Verified 0 orphans after the fix (`card_voucher_activity` is derived from the voucher sample). |
 | Raw purchase activity uses plan ID | **Valid** | v6 uses the originating transaction ID; 0 orphans. |
 | Refund lineage missing | **Valid** | v6 adds `original_transaction_id`; 0 refunds without a parent. |
-| Checklist wording (`PAID_FULL` “exceed” vs “short of”) | **Valid** | Corrected in `hand_off_v6.md` §13. |
+| Checklist wording (`PAID_FULL` “exceed” vs “short of”) | **Valid** | Corrected in `docs/archive/hand_off_v6.md` §13. |
 
 **Result: 10 / 10 valid.** No overstatement found.
 
@@ -91,7 +91,7 @@ declined with rationale.
 | `CREDIT_BALANCE` unvalidated | **Valid** | v6 validates the status mapping and `dim_account.credit_balance`; 0 mismatches. |
 | Duplicate emails/phones | **Valid** | v6: 0 duplicate emails, 0 duplicate phones across 50,000 customers. |
 | Validator blind spots (minimum due, tolerances, `applied_statement_id`) | **Valid** | v6 tightens tolerances to $0.01 and makes `applied_statement_id` the first allocation; 0 mismatches. |
-| Documentation arithmetic | **Valid** | `hand_off_v6.md` §11 separates star-schema and total row counts; README rewritten. |
+| Documentation arithmetic | **Valid** | `docs/archive/hand_off_v6.md` §11 separates star-schema and total row counts; README rewritten. |
 
 **Result: 7 / 7 valid.**
 
@@ -179,7 +179,7 @@ not defects.
 10. **App events loosely coupled** to transactions.
 11. **Identifiers are synthetic but not reserved-range.**
 
-These are disclosed in `hand_off_v6.md` §12 and `README.md` §6.
+These are disclosed in `docs/archive/hand_off_v6.md` §12 and `README.md` §6.
 
 ---
 
@@ -191,8 +191,8 @@ These are disclosed in `hand_off_v6.md` §12 and `README.md` §6.
 | `REVIEW_GUIDE.md` said “8 dimensions, 9 facts” | corrected to 8 / 11 |
 | `data_dictionary.md` described `utilization_pct` as an unsigned percentage | now states ratio, signed, capped |
 | `docs` regenerated from the released Parquet | `refresh_docs` exit 0 |
-| `HANDOFF_FOR_REVIEW.md` (v4 era) | marked superseded, content preserved |
-| `v5_review_addendum.md` | marked superseded, content preserved |
+| `docs/archive/HANDOFF_FOR_REVIEW.md` (v4 era) | marked superseded, content preserved |
+| `docs/archive/v5_review_addendum.md` | marked superseded, content preserved |
 
 No earlier reviewer section was modified.
 
@@ -220,7 +220,7 @@ python -m build.run_all          # exits non-zero on any FAIL
 python -m build.refresh_docs     # regenerates validation + dictionary from Parquet
 ```
 
-Independent checks: `hand_off_v6.md` §14, or the script summarised in §3 above.
+Independent checks: `docs/archive/hand_off_v6.md` §14, or the script summarised in §3 above.
 Release integrity: `credit_card_data_v6/release_manifest.json` (38 file hashes,
 8 doc hashes, `released: true`).
 

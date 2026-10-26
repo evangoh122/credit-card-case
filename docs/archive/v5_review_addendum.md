@@ -1,11 +1,11 @@
 > **SUPERSEDED - historical record only.**
 > This document describes an earlier candidate and is retained for audit.
-> The current release record is `feedback_v6.md` and `hand_off_v6.md`.
+> The current release record is `docs/archive/feedback_v6.md` and `docs/archive/hand_off_v6.md`.
 
 # V5 review addendum
 
-*Appended to `build_v5_log.txt` after the build completes. Kept as a standalone
-file (`v5_review_addendum.md`) so reviewers can cite it directly.*
+*Appended to the v5 build log (deleted from the repo; see git history) after the build completes. Kept as a standalone
+file (`docs/archive/v5_review_addendum.md`) so reviewers can cite it directly.*
 
 ---
 
@@ -191,5 +191,5 @@ If any of those fail, the build should be rejected again.
 
 ---
 
-*End of addendum. Generated as part of the v5 release; append to `build_v5_log.txt`
+*End of addendum. Generated as part of the v5 release; append to the v5 build log (deleted from the repo; see git history)
 once the build process releases the file.*
