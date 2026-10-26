@@ -157,6 +157,8 @@ def simulate_events(
 
 
 def label(df: pl.DataFrame, loaded_at: datetime) -> pl.DataFrame:
+    if loaded_at.tzinfo is None:
+        raise ValueError("loaded_at must be timezone-aware")
     return df.with_columns(
         pl.lit(loaded_at.astimezone(UTC)).cast(pl.Datetime("us", "UTC")).alias("loaded_at"),
         pl.lit(DATA_LABEL).alias("data_label"),

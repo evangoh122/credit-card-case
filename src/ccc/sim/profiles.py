@@ -104,12 +104,33 @@ def fit_copula(seed_table: pl.DataFrame):
     return synth
 
 
+def _copula_rows(synth, seed: int, ids: list[str]) -> pl.DataFrame:
+    """Per-customer draws through the fitted copula: seeded normals, correlated with the
+    fitted matrix, mapped through the fitted marginals, then the SDV reverse transform."""
+    import pandas as pd
+    from scipy.special import ndtr as cdf
+
+    model = synth._model
+    chol = np.linalg.cholesky(np.asarray(model.correlation))
+    normals = np.array(
+        [entity_rng(seed, "arrivals", c, -4).standard_normal(len(chol)) for c in ids]
+    )
+    u = cdf(normals @ chol.T)
+    processed = pd.DataFrame(
+        {
+            col: uni.percent_point(u[:, i])
+            for i, (col, uni) in enumerate(zip(model.columns, model.univariates, strict=True))
+        }
+    )
+    original = synth._data_processor.reverse_transform(processed)
+    return pl.DataFrame(original.to_dict("list"))
+
+
 def copula_table(
     synth, seed: int, specs: list[tuple[str, int]], shift: CohortShift
 ) -> pl.DataFrame:
-    """Cohort-level sampling: rows depend on the whole spec list, unlike handwritten_table."""
-    synth.reset_sampling()
-    sampled = pl.DataFrame(synth.sample(len(specs))["seed"].to_dict("list"))
+    """A customer's row depends only on (seed, customer_id, cohort_day) and the fitted copula."""
+    sampled = _copula_rows(synth, seed, [c for c, _ in specs])
     df = sampled.with_columns(
         pl.Series("customer_id", [c for c, _ in specs]),
         pl.Series("cohort_day", [d for _, d in specs]),

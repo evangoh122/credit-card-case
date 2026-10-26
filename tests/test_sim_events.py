@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import polars as pl
 import pytest
@@ -33,15 +33,36 @@ def test_same_seed_same_output_and_other_seed_differs(sim):
     assert not other["fact_transactions"].equals(tables["fact_transactions"])
 
 
-def test_adding_customers_does_not_change_existing_events(small_scenario):
-    base = run.simulate(SEED, 10, small_scenario)
+def _check_adding_customers(small_scenario, source):
+    base = run.simulate(SEED, 10, small_scenario, profile_source=source)
     bigger_sc = Scenario(**{**small_scenario.__dict__, "initial_customers": 220})
-    bigger = run.simulate(SEED, 10, bigger_sc)
+    bigger = run.simulate(SEED, 10, bigger_sc, profile_source=source)
     ids = base["dim_customer"]["customer_id"]
     assert ids.is_in(bigger["dim_customer"]["customer_id"].implode()).all()
-    for name, key in (("fact_transactions", "transaction_id"), ("fact_events", "event_id")):
+    for name, key in (
+        ("dim_customer", "customer_id"),
+        ("sim_truth_customer", "customer_id"),
+        ("fact_transactions", "transaction_id"),
+        ("fact_events", "event_id"),
+    ):
         kept = bigger[name].filter(pl.col("customer_id").is_in(ids.implode())).sort(key)
         assert kept.equals(base[name].sort(key)), name
+
+
+def test_adding_customers_does_not_change_existing_events(small_scenario):
+    _check_adding_customers(small_scenario, "handwritten")
+
+
+@pytest.mark.slow
+def test_adding_customers_does_not_change_existing_events_copula(small_scenario):
+    _check_adding_customers(small_scenario, "copula")
+
+
+def test_naive_loaded_at_rejected(small_scenario):
+    with pytest.raises(ValueError, match="timezone-aware"):
+        run.simulate(SEED, 2, small_scenario, loaded_at=datetime(2026, 11, 1))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        events.label(pl.DataFrame({"a": [1]}), datetime(2026, 11, 1))
 
 
 def test_output_schemas_and_labels(sim):

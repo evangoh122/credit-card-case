@@ -30,6 +30,8 @@ def simulate(
     locale: str = "en_US",
     loaded_at: datetime | None = None,
 ) -> dict[str, pl.DataFrame]:
+    if loaded_at is not None and loaded_at.tzinfo is None:
+        raise ValueError("loaded_at must be timezone-aware")
     if profile_source not in ("handwritten", "copula"):
         raise ValueError("profile_source must be 'handwritten' or 'copula'")
     specs = cohort_specs(seed, sc, days)
