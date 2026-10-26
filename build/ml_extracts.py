@@ -408,11 +408,68 @@ def build_fraud(df: pd.DataFrame) -> dict:
 
 
 # --------------------------------------------------------------------------
+# As-of payment status (round 5)
+# --------------------------------------------------------------------------
+# fact_statement.payment_status / paid_amount / last_payment_date are settled
+# with ALL later card cash up to PAYMENT_HORIZON (facts._settled_closing_amounts,
+# facts._stmt_status), i.e. with payments dated after the observation date. They
+# must never feed a point-in-time feature. The status below is recomputed from
+# fact_payment_allocation rows dated on or before the observation date only.
+# statement.payments_amount / closing_balance / minimum_due / utilization_pct and
+# delinquency snapshots are as-of the statement cut (cash dated <= cycle end), so
+# they are safe.
+def check_payment_sources_asof(alloc_used: pd.DataFrame, obs: pd.Timestamp,
+                               date_col: str = "allocation_date") -> tuple[bool, str]:
+    """Fail if any payment event feeding a feature is dated after ``obs``."""
+    if alloc_used.empty:
+        return True, "no payment events used"
+    latest = pd.to_datetime(alloc_used[date_col]).max()
+    bad = int((pd.to_datetime(alloc_used[date_col]) > obs).sum())
+    return bad == 0, f"{bad} payment events after observation (latest {latest.date()})"
+
+
+def asof_payment_status(hist: pd.DataFrame, allocations: pd.DataFrame,
+                        obs: pd.Timestamp) -> tuple[pd.Series, pd.Series, pd.DataFrame]:
+    """Payment status of each statement using only payments dated <= ``obs``.
+
+    Returns (status indexed like ``hist``, latest payment date used per
+    statement, the allocation rows used). Mirrors ``facts._stmt_status`` with
+    allocation-so-far in place of the final settlement.
+    """
+    a = allocations.copy()
+    a["allocation_date"] = pd.to_datetime(a.allocation_date)
+    used = a[a.allocation_date <= obs]
+    paid = used.groupby("statement_id").amount_usd.sum()
+    last_pay = used.groupby("statement_id").allocation_date.max()
+    allocated = hist.statement_id.map(paid).fillna(0.0).astype(float)
+    close = hist.closing_balance.astype(float)
+    billed = hist.billed_amount.astype(float)
+    due = pd.to_datetime(hist.payment_due_date)
+    min_due = hist.minimum_due.astype(float)
+    conds = [
+        close < -0.01,
+        billed <= 0.01,
+        close <= 0.0001,
+        allocated >= billed - 0.01,
+        (min_due > 0.01) & (allocated >= min_due - 0.01),
+        allocated > 0.01,
+        due > obs,
+    ]
+    status = np.select(
+        conds,
+        ["CREDIT_BALANCE", np.where(close <= 0.0001, "NO_BALANCE", "CARRY_FORWARD"),
+         "NO_BALANCE", "PAID_FULL", "PAID_PARTIAL", "PARTIAL", "PENDING"],
+        default="UNPAID")
+    return (pd.Series(status, index=hist.index),
+            hist.statement_id.map(last_pay), used)
+
+
+# --------------------------------------------------------------------------
 # Point-in-time credit default / churn
 # --------------------------------------------------------------------------
 def build_credit_default(df: pd.DataFrame, accounts: pd.DataFrame,
                          customers: pd.DataFrame, statements: pd.DataFrame,
-                         delinq: pd.DataFrame) -> None:
+                         delinq: pd.DataFrame, allocations: pd.DataFrame) -> None:
     log("  ml: credit default")
     obs = pd.Timestamp(C.ML_OBSERVATION_DATE)
     end = pd.Timestamp(C.ML_OUTCOME_END)
@@ -421,6 +478,14 @@ def build_credit_default(df: pd.DataFrame, accounts: pd.DataFrame,
     hist = st[st.statement_date <= obs].sort_values(["account_id", "statement_date"])
     if hist.empty:
         raise RuntimeError("no statements before the observation date")
+
+    # payment_status as known on the observation date (not the final status)
+    hist = hist.copy()
+    hist["payment_status"], hist["_last_pay"], alloc_used = asof_payment_status(
+        hist, allocations, obs)
+    ok, detail = check_payment_sources_asof(alloc_used, obs)
+    if not ok:
+        raise RuntimeError(f"credit_default leakage: {detail}")
 
     last = hist.groupby("account_id", sort=False).tail(1)
     last3 = hist.groupby("account_id", sort=False).tail(3)
@@ -444,6 +509,8 @@ def build_credit_default(df: pd.DataFrame, accounts: pd.DataFrame,
         "payment_status": "status_at_obs",
     })
     feats = feats.join(agg3, on="account_id")
+    feats["payment_feature_date"] = feats.account_id.map(
+        last3.groupby("account_id")["_last_pay"].max())
 
     ds = delinq.copy()
     ds["snapshot_date"] = pd.to_datetime(ds.snapshot_date)
@@ -491,7 +558,8 @@ def build_credit_default(df: pd.DataFrame, accounts: pd.DataFrame,
     feats["outcome_start"] = obs + pd.Timedelta(days=1)
     feats["outcome_end"] = end
     feats["max_source_date"] = pd.to_datetime(
-        feats[["feature_statement_date", "delinq_feature_date"]].max(axis=1))
+        feats[["feature_statement_date", "delinq_feature_date",
+               "payment_feature_date"]].max(axis=1))
     feats["max_source_date"] = feats.max_source_date.fillna(obs)
     feats["split_entity"] = np.where(
         feats.account_id.map(lambda x: _hash_bucket(x) == 0), "test", "train")
@@ -658,7 +726,11 @@ dependencies) must score PR-AUC < 0.95 on the out-of-time split.
 `credit_default_features.parquet` is account-level, one row per account with an
 observation date of 2026-03-31. Features use only statements, transactions and
 delinquency snapshots on or before that date; `max_source_date` records the
-latest fact date used and must not exceed `observation_date`. The label
+latest fact date used (statement, delinquency snapshot and payment event) and
+must not exceed `observation_date`. `status_at_obs` and `paid_full_share_3m`
+are recomputed from payment allocations dated on or before the observation date;
+the final `fact_statement.payment_status` is settled with later cash and is not
+used. The label
 (`label_default`) is 1 when the account reaches 60+ DPD or is charged off in
 the outcome window 2026-04-01..2026-09-30. `split_entity` is an 80/20 SHA-256
 account split; `credit_default_train.parquet` / `credit_default_test.parquet`
@@ -711,13 +783,16 @@ def build_all() -> dict:
                         "statement_date", "opening_balance", "closing_balance",
                         "purchases_amount", "payments_amount", "interest_charged",
                         "fees_charged", "minimum_due", "credit_limit",
-                        "utilization_pct", "payment_status"])
+                        "utilization_pct", "payment_status", "billed_amount",
+                        "payment_due_date"])
+    allocations = _read("fact/fact_payment_allocation.parquet",
+                        ["statement_id", "allocation_date", "amount_usd"])
     delinq = _read("fact/fact_delinquency_snapshot.parquet",
                    ["account_id", "snapshot_date", "days_past_due",
                     "delinquency_status"])
 
     report = build_fraud(purchases)
-    build_credit_default(purchases, accounts, customers, statements, delinq)
+    build_credit_default(purchases, accounts, customers, statements, delinq, allocations)
     build_churn(purchases, customers, statements)
     build_segmentation(purchases)
     build_forecast(purchases)
