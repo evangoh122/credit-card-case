@@ -1,3 +1,4 @@
+import signal
 import socket
 import subprocess
 import sys
@@ -60,13 +61,50 @@ def test_main_rejects_same_port():
         ui.main(["--port", "7000", "--evidently-port", "7000"])
 
 
-def test_serve_terminates_children_on_ctrl_c():
-    procs = [mock.Mock(), mock.Mock()]
-    for p in procs:
-        p.poll.return_value = None
-        p.returncode = 0
-    procs[0].wait.side_effect = [KeyboardInterrupt, None]
-    with mock.patch.object(subprocess, "Popen", side_effect=procs):
+def _fake_proc(pid):
+    p = mock.Mock(pid=pid, returncode=0)
+    p.poll.return_value = None
+    return p
+
+
+def test_serve_stops_every_child_even_if_one_already_exited():
+    procs = [_fake_proc(101), _fake_proc(102)]
+    procs[0].wait.side_effect = [KeyboardInterrupt, None, None]
+    sent = []
+
+    def killpg(pid, sig):
+        sent.append((pid, sig))
+        if pid == 101:
+            raise ProcessLookupError
+
+    with (
+        mock.patch.object(subprocess, "Popen", side_effect=procs) as popen,
+        mock.patch.object(ui.os, "killpg", side_effect=killpg),
+    ):
         assert ui.serve([["a"], ["b"]]) == 0
-    for p in procs:
-        p.terminate.assert_called_once()
+    assert all(c.kwargs["start_new_session"] for c in popen.call_args_list)
+    assert (102, signal.SIGTERM) in sent and (102, signal.SIGKILL) in sent
+    procs[1].wait.assert_called()
+
+
+def test_serve_cleans_up_first_child_when_second_spawn_fails():
+    first = _fake_proc(201)
+    with (
+        mock.patch.object(subprocess, "Popen", side_effect=[first, OSError("boom")]),
+        mock.patch.object(ui.os, "killpg") as killpg,
+        pytest.raises(OSError),
+    ):
+        ui.serve([["a"], ["b"]])
+    killpg.assert_any_call(201, signal.SIGTERM)
+    first.wait.assert_called()
+
+
+def test_stop_kills_group_when_child_ignores_sigterm():
+    p = _fake_proc(301)
+    p.wait.side_effect = [subprocess.TimeoutExpired("x", 1), None]
+    with mock.patch.object(ui.os, "killpg") as killpg:
+        ui._stop([p])
+    assert [c.args for c in killpg.call_args_list] == [
+        (301, signal.SIGTERM),
+        (301, signal.SIGKILL),
+    ]
