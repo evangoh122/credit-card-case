@@ -2,6 +2,7 @@ import dataclasses
 import hashlib
 import importlib.metadata
 import json
+import logging
 import math
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ from scipy.stats import norm
 from ccc import drift
 from ccc.sim import events, profiles, run, scenario
 
+LOGGER = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NUMERIC_FEATURES = ("risk", "spend_rate", "responsiveness", "utilisation")
 CATEGORICAL_FEATURES = ("channel", "region")
@@ -23,6 +25,8 @@ PSI_BINS = 5
 DEFAULT_MIN_RECOVERY = 0.9
 DEFAULT_ALPHA = 0.05
 EXPERIMENT = "ccc-simulation"
+NULL_FAMILY = "null_family"
+MULTIPLE_COMPARISON_POLICY = "bonferroni_within_seed"
 EVENT_RATE = {"purchase": events.purchase_rate, "app_open": events.open_rate}
 
 
@@ -121,6 +125,13 @@ def estimate_lift(
     return out
 
 
+def validate_thresholds(alpha: float, min_recovery: float) -> None:
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be in (0, 1)")
+    if not 0 <= min_recovery <= 1:
+        raise ValueError("min_recovery must be in [0, 1]")
+
+
 def summarize_recovery(
     per_seed: list[dict[str, dict]],
     campaigns: tuple[scenario.Campaign, ...],
@@ -128,11 +139,16 @@ def summarize_recovery(
     alpha: float = DEFAULT_ALPHA,
 ) -> dict[str, dict]:
     """Planted campaigns must be recovered (CI covers truth and excludes zero) in at least
-    min_recovery of seeds; null campaigns must be detected in at most alpha of seeds."""
-    summary = {}
+    min_recovery of seeds. Null campaigns are judged together: the share of seeds in which
+    any null campaign is detected (family-wise false-positive rate) must be at most alpha.
+    The per-seed lifts are expected to come from estimate_lift at alpha / n_campaigns."""
+    validate_thresholds(alpha, min_recovery)
+    if not per_seed:
+        raise ValueError("per_seed must not be empty")
+    n = len(per_seed)
+    summary: dict[str, dict] = {}
     for c in campaigns:
         rows = [s[c.name] for s in per_seed]
-        n = len(rows)
         if c.lift > 0:
             share = sum(r["covered"] and r["detected"] for r in rows) / n
             summary[c.name] = {
@@ -141,14 +157,16 @@ def summarize_recovery(
                 "threshold": min_recovery,
                 "ok": share >= min_recovery,
             }
-        else:
-            share = sum(r["detected"] for r in rows) / n
-            summary[c.name] = {
-                "kind": "null",
-                "share": share,
-                "threshold": alpha,
-                "ok": share <= alpha,
-            }
+    nulls = [c.name for c in campaigns if c.lift == 0]
+    if nulls:
+        share = sum(any(s[name]["detected"] for name in nulls) for s in per_seed) / n
+        summary[NULL_FAMILY] = {
+            "kind": "null_family",
+            "campaigns": nulls,
+            "share": share,
+            "threshold": alpha,
+            "ok": share <= alpha,
+        }
     return summary
 
 
@@ -161,10 +179,16 @@ def make_reference(tables: dict[str, pl.DataFrame]) -> drift.Reference:
     return drift.make_reference(initial, NUMERIC_FEATURES, CATEGORICAL_FEATURES, n_bins=PSI_BINS)
 
 
-def drift_for(ref: drift.Reference, tables: dict[str, pl.DataFrame], cohort_day: int) -> dict:
+def drift_for(
+    ref: drift.Reference, tables: dict[str, pl.DataFrame], cohort_day: int
+) -> tuple[dict, str]:
+    """PSI report for cohorts from cohort_day on; basis says what was compared."""
     df = feature_table(tables)
     late = df.filter(pl.col("cohort_day") >= cohort_day)
-    return drift.drift_report(ref, late if late.height else df)
+    if late.height:
+        return drift.drift_report(ref, late), "late_cohorts"
+    LOGGER.warning("no customers at cohort day >= %d; drift compared on all customers", cohort_day)
+    return drift.drift_report(ref, df), "all_customers_no_late_cohort"
 
 
 def data_dictionary(tables: dict[str, pl.DataFrame], hashes: dict[str, str]) -> dict:
@@ -284,6 +308,9 @@ def run_simulation_study(
 ) -> dict:
     if not seeds:
         raise ValueError("seeds must not be empty")
+    if days < 1:
+        raise ValueError("days must be at least 1")
+    validate_thresholds(alpha, min_recovery)
     if with_sdv_scores and profile_source != "copula":
         raise ValueError("SDV scores require profile_source='copula'")
     if not isinstance(sc, scenario.Scenario):
@@ -291,6 +318,8 @@ def run_simulation_study(
     if n_initial is not None:
         sc = dataclasses.replace(sc, initial_customers=n_initial)
     cohort_day = days // 2
+    synthesizer = "gaussian_copula" if profile_source == "copula" else "handwritten"
+    alpha_per_test = alpha / max(len(sc.campaigns), 1)
     exp_id = _setup(Path(tracking_dir), tracking_uri, experiment)
     tags = {
         "data_label": events.DATA_LABEL,
@@ -308,13 +337,15 @@ def run_simulation_study(
                 "seeds": ",".join(map(str, seeds)),
                 "faker_locale": locale,
                 "profile_source": profile_source,
-                "synthesizer": "gaussian_copula" if profile_source == "copula" else "handwritten",
+                "synthesizer": synthesizer,
                 "customer_count": sc.initial_customers,
                 "cohort_day": cohort_day,
                 "days": days,
                 "scenario_config": sc.name,
                 "min_recovery": min_recovery,
                 "alpha": alpha,
+                "multiple_comparison_policy": MULTIPLE_COMPARISON_POLICY,
+                "alpha_per_test": alpha_per_test,
             }
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -325,7 +356,7 @@ def run_simulation_study(
             tables = run.simulate(seed, days, sc, profile_source=profile_source, locale=locale)
             if ref is None:
                 ref = make_reference(tables)
-            lifts = {c.name: estimate_lift(tables, c, alpha) for c in sc.campaigns}
+            lifts = {c.name: estimate_lift(tables, c, alpha_per_test) for c in sc.campaigns}
             per_seed.append(lifts)
             scores = sdv_scores(seed, tables) if with_sdv_scores else {}
             with (
@@ -338,12 +369,15 @@ def run_simulation_study(
                         "root_seed": seed,
                         "faker_locale": locale,
                         "profile_source": profile_source,
+                        "synthesizer": synthesizer,
                         "customer_count": sc.initial_customers,
                         "cohort_day": cohort_day,
                         "scenario_config": sc.name,
+                        "alpha_per_test": alpha_per_test,
                     }
                 )
-                report = drift_for(ref, tables, cohort_day)
+                report, basis = drift_for(ref, tables, cohort_day)
+                mlflow.log_param("drift_basis", basis)
                 seed_hashes[seed] = _log_seed(
                     seed, tables, lifts, report, Path(tmp) / "out", scores
                 )
@@ -359,6 +393,8 @@ def run_simulation_study(
         "experiment_id": exp_id,
         "tracking_uri": mlflow.get_tracking_uri(),
         "summary": summary,
+        "per_seed_lifts": per_seed,
+        "alpha_per_test": alpha_per_test,
         "data_hashes": seed_hashes,
         "ok": all(s["ok"] for s in summary.values()),
     }
@@ -367,14 +403,15 @@ def run_simulation_study(
 def format_summary(summary: dict[str, dict]) -> str:
     lines = []
     for name, s in summary.items():
+        status = "ok" if s["ok"] else "FAIL"
         if s["kind"] == "planted":
             lines.append(
                 f"{name}: planted effect recovered in {s['share']:.0%} of seeds "
-                f"(need {s['threshold']:.0%}) {'ok' if s['ok'] else 'FAIL'}"
+                f"(need {s['threshold']:.0%}) {status}"
             )
         else:
             lines.append(
-                f"{name}: null campaign detected in {s['share']:.0%} of seeds "
-                f"(allowed {s['threshold']:.0%}) {'ok' if s['ok'] else 'FAIL'}"
+                f"null campaigns {', '.join(s['campaigns'])}: any detected in "
+                f"{s['share']:.0%} of seeds (family-wise, allowed {s['threshold']:.0%}) {status}"
             )
     return "\n".join(lines)
