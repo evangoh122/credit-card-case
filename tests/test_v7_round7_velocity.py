@@ -84,7 +84,7 @@ def _history():
 
 def _syn():
     s = pd.DataFrame({"customer_id": ["A"], "transaction_id": ["SYNTEST00000001"],
-                      "transaction_ts": [T - pd.Timedelta(hours=2)],
+                      "transaction_ts": [T - pd.Timedelta(hours=12)],
                       "transaction_date": [(T - pd.Timedelta(days=1)).normalize()],
                       "amount_usd": [3.0], "hour": [8], "is_card_present": [True],
                       "is_international": [False], "category": ["Grocery"],
