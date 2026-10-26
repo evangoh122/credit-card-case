@@ -15,12 +15,41 @@ RFM_COLUMNS = ("recency", "frequency", "monetary")
 TIERS = ("Prime", "Watch", "Nurture", "Decline")
 MODEL_VERSION = "seg-1.0.0"
 NEW_CUSTOMER_DAYS = 30
+TIER_K = 4
+MIN_CENTROID_SEPARATION = 1e-3  # scaled units; closer centroids count as duplicates
+
+# Leakage policy: a column whose lower-cased name contains any of these substrings may be
+# measured at or after the offer and is rejected everywhere. The match is deliberately
+# conservative: pre-offer columns such as "preoffer_spend" are rejected too because the
+# name alone cannot prove the measurement window, and benign names that happen to contain a
+# pattern (e.g. "coffer", "irresponsible") are false positives the caller must rename.
+# "postcode" and similar names without "post_" pass.
+LEAKAGE_PATTERNS = (
+    "offer",
+    "post_",
+    "post-",
+    "postoffer",
+    "accepted",
+    "response",
+    "outcome",
+    "treatment",
+    "exposure",
+)
 
 
 def _reject_leaky_columns(columns: Sequence[str]) -> None:
     for name in columns:
-        if name.startswith("offer") or name.startswith("post_"):
+        lowered = str(name).lower()
+        if any(pattern in lowered for pattern in LEAKAGE_PATTERNS):
             raise ValueError(f"column {name!r} is measured after an offer and must not be used")
+
+
+def _check_centroids_distinct(centroids: np.ndarray) -> None:
+    n = centroids.shape[0]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if np.linalg.norm(centroids[i] - centroids[j]) < MIN_CENTROID_SEPARATION:
+                raise ValueError(f"clusters {i} and {j} have duplicate centroids")
 
 
 def _numeric_frame(features: pl.DataFrame, names: Sequence[str]) -> pl.DataFrame:
@@ -75,6 +104,16 @@ class RuleThresholds:
     utilisation: float
     spend: float
     activity: float
+
+    def __post_init__(self) -> None:
+        for name in ("arrears", "utilisation", "spend", "activity"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(
+                value, (int, float, np.integer, np.floating)
+            ):
+                raise ValueError(f"threshold {name!r} must be a real number, got {value!r}")
+            if not np.isfinite(value):
+                raise ValueError(f"threshold {name!r} must be finite, got {value!r}")
 
 
 @dataclass(frozen=True)
@@ -149,9 +188,16 @@ def fit_segmenter(
     x = _matrix(features, names)
     if isinstance(k, bool) or not isinstance(k, int) or not 2 <= k <= x.shape[0]:
         raise ValueError(f"k must be an integer in [2, {x.shape[0]}], got {k!r}")
+    if len(np.unique(x, axis=0)) < k:
+        raise ValueError(f"need at least {k} distinct observations to fit {k} clusters")
+    # A zero-variance column is allowed: StandardScaler gives it scale 1.0, so it adds the
+    # same distance to every centroid and cannot affect assignment.
     scaler = StandardScaler()
     z = scaler.fit_transform(x)
     km = KMeans(n_clusters=k, random_state=random_state, n_init=10).fit(z)
+    if len(np.unique(km.labels_)) != k:
+        raise ValueError(f"degenerate clustering: fewer than {k} populated clusters")
+    _check_centroids_distinct(np.asarray(km.cluster_centers_, dtype=float))
     mean = tuple(float(v) for v in scaler.mean_)
     scale = tuple(float(v) for v in scaler.scale_)
     centroids = tuple(tuple(float(v) for v in row) for row in km.cluster_centers_)
@@ -164,18 +210,35 @@ def fit_segmenter(
     )
 
 
+def fit_tiered(
+    features: pl.DataFrame,
+    include_rfm: bool = False,
+    random_state: int = 0,
+) -> tuple[SegmentModel, tuple[str, ...]]:
+    """Fit the tiering model: always k=4 (TIER_K), plus the tier of each cluster index."""
+    model = fit_segmenter(features, TIER_K, include_rfm, random_state)
+    return model, map_clusters_to_tiers(model.centroids, model.feature_names)
+
+
 def choose_k(
     features: pl.DataFrame,
     k_range: Iterable[int],
     include_rfm: bool = False,
     random_state: int = 0,
 ) -> tuple[pl.DataFrame, int]:
+    """Silhouette per k plus the best k, as a diagnostic.
+
+    k_range must include 4. Tiering always uses k=4 (see fit_tiered); if the best k is not 4
+    the table shows how much silhouette the four-tier structure gives up.
+    """
     names = _feature_names(include_rfm)
     x = _matrix(features, names)
     n = x.shape[0]
     ks = list(k_range)
     if not ks:
         raise ValueError("k_range must not be empty")
+    if TIER_K not in ks:
+        raise ValueError(f"k_range must include {TIER_K}, the cluster count tiering requires")
     z = StandardScaler().fit_transform(x)
     scores = []
     for k in ks:
@@ -197,7 +260,8 @@ def map_clusters_to_tiers(
     Nurture: lowest spend + activity among the rest.
     Prime: highest spend + activity - arrears - utilisation among the rest.
     Watch: the leftover cluster.
-    Ties resolve to the lowest cluster index.
+    Ties resolve by centroid values, never by cluster index, so permuting the cluster
+    order gives the same tier for each centroid. Duplicate centroids are rejected.
     """
     arr = np.asarray(centroids, dtype=float)
     names = tuple(feature_names)
@@ -209,18 +273,22 @@ def map_clusters_to_tiers(
     missing = [name for name in needed if name not in names]
     if missing:
         raise ValueError(f"missing feature columns: {missing}")
+    if not np.isfinite(arr).all():
+        raise ValueError("centroids must be finite")
+    _check_centroids_distinct(arr)
     a, u, s, act = (names.index(name) for name in needed)
     risk = arr[:, a] + arr[:, u]
     engage = arr[:, s] + arr[:, act]
     tiers = [""] * arr.shape[0]
     remaining = list(range(arr.shape[0]))
-    decline = max(remaining, key=lambda i: (risk[i], -i))
+    rows = [tuple(row) for row in arr.tolist()]
+    decline = max(remaining, key=lambda i: (risk[i], rows[i]))
     remaining.remove(decline)
     tiers[decline] = "Decline"
-    nurture = min(remaining, key=lambda i: (engage[i], i))
+    nurture = min(remaining, key=lambda i: (engage[i], rows[i]))
     remaining.remove(nurture)
     tiers[nurture] = "Nurture"
-    prime = max(remaining, key=lambda i: (engage[i] - risk[i], -i))
+    prime = max(remaining, key=lambda i: (engage[i] - risk[i], rows[i]))
     remaining.remove(prime)
     tiers[prime] = "Prime"
     tiers[remaining[0]] = "Watch"
@@ -272,6 +340,8 @@ def hard_credit_rules(df: pl.DataFrame) -> pl.Series:
     for name in ("arrears", "days_active"):
         if not frame.schema[name].is_numeric():
             raise TypeError(f"{name} must be numeric")
+        if not np.isfinite(frame[name].cast(pl.Float64).to_numpy()).all():
+            raise ValueError(f"{name} must be finite")
     decline = (pl.col("arrears") > 0) | pl.col("over_limit")
     nurture = pl.col("days_active") < NEW_CUSTOMER_DAYS
     return frame.select(
