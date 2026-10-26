@@ -1,5 +1,7 @@
 import argparse
 import contextlib
+import os
+import signal
 import socket
 import subprocess
 import sys
@@ -39,23 +41,31 @@ def evidently_command(workspace: str | Path, port: int) -> list[str]:
     ]  # fmt: skip
 
 
+def _signal_group(p: subprocess.Popen, sig: int) -> None:
+    try:
+        os.killpg(p.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def _stop(procs: list[subprocess.Popen]) -> None:
+    """Terminate every child's process group, then kill whatever is left."""
     for p in procs:
-        if p.poll() is None:
-            p.terminate()
+        _signal_group(p, signal.SIGTERM)
     for p in procs:
         try:
             p.wait(timeout=STOP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            p.kill()
-            p.wait()
+            pass
+        _signal_group(p, signal.SIGKILL)
+        p.wait()
 
 
 def serve(commands: list[list[str]]) -> int:
     procs: list[subprocess.Popen] = []
     try:
         for cmd in commands:
-            procs.append(subprocess.Popen(cmd))
+            procs.append(subprocess.Popen(cmd, start_new_session=True))
         while all(p.poll() is None for p in procs):
             with contextlib.suppress(subprocess.TimeoutExpired):
                 procs[0].wait(timeout=1)

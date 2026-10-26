@@ -23,5 +23,6 @@ uv run ruff check . && uv run ruff format --check .
   the store is `./mlruns` (gitignored); `--sdv-scores` needs `--profiles copula`.
 - `python -m ccc.ui`: starts the MLflow UI (study store, `:5000`) and the Evidently UI (`:8000`,
   workspace `./evidently_workspace`, gitignored); Ctrl-C stops both. `python -m ccc.evidently_data
-  --scenario scenarios/default.toml` writes a reference (day 0) vs late-cohort `DataDriftPreset`
-  snapshot into that workspace. `requirements.txt` is `uv export --no-hashes --no-dev`.
+  --scenario scenarios/default.toml` writes a `DataDriftPreset`
+  snapshot there (pre-start vs late joiners, observable features only). `requirements.txt` is
+  `uv export --no-hashes --no-dev`.
