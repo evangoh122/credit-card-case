@@ -1,5 +1,6 @@
 from datetime import date, datetime
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -138,12 +139,33 @@ DST_ZONES = (
     "America/Denver",
     "America/Los_Angeles",
 )
+DST_DAY_HOURS = {date(2026, 11, 1): 25, date(2026, 3, 8): 23}
+
+
+def _expected_day_hours(tz, day):
+    return DST_DAY_HOURS[day] if tz in DST_ZONES else 24
+
+
+class _DenseRng:
+    def __init__(self, count=96):
+        self.count = count
+
+    def poisson(self, lam):
+        return self.count
+
+    def random(self, size=None):
+        if size is None:
+            return 0.5
+        return (np.arange(size) + 0.5) / size
+
+    def lognormal(self, mean, sigma, size=None):
+        return 1.0 if size is None else np.ones(size)
 
 
 @pytest.mark.parametrize("tz", ZONES)
 @pytest.mark.parametrize(("day", "dst_hours"), [(date(2026, 11, 1), 25), (date(2026, 3, 8), 23)])
 def test_local_day_generation_covers_exact_utc_hour_buckets(tz, day, dst_hours):
-    expected = dst_hours if tz in DST_ZONES else 24
+    expected = _expected_day_hours(tz, day)
     lo, hi = local_day_bounds_utc(day, tz)
     total_s = int((hi - lo).total_seconds())
     assert total_s == expected * 3600
@@ -156,6 +178,36 @@ def test_local_day_generation_covers_exact_utc_hour_buckets(tz, day, dst_hours):
     buckets = {int((ts - lo).total_seconds() // 3600) for ts in stamps}
     assert buckets == set(range(expected))
     assert {utc_to_local_date(ts, tz) for ts in stamps} == {day}
+
+
+@pytest.mark.parametrize("tz", ZONES)
+@pytest.mark.parametrize("day", [date(2026, 11, 1), date(2026, 3, 8)])
+def test_simulate_events_covers_exact_utc_hour_buckets(monkeypatch, tz, day):
+    expected = _expected_day_hours(tz, day)
+    monkeypatch.setattr(events, "entity_rng", lambda *args: _DenseRng())
+    monkeypatch.setattr(events, "_ppf", lambda q: q)
+    sc = Scenario("dst", day, initial_customers=1, arrivals_per_day=0.0, campaigns=())
+    customers = pl.DataFrame(
+        {
+            "customer_id": ["c"],
+            "join_day": [0],
+            "risk": [0.5],
+            "spend_rate": [1.0],
+            "utilisation": [0.5],
+            "tz": [tz],
+        }
+    )
+    txns, evts = events.simulate_events(1, sc, customers, 1)
+    stamps = [
+        *txns.get_column("event_ts_utc").to_list(),
+        *evts.get_column("event_ts_utc").to_list(),
+    ]
+    lo, hi = local_day_bounds_utc(day, tz)
+    assert stamps
+    assert all(lo <= ts < hi for ts in stamps)
+    assert {utc_to_local_date(ts, tz) for ts in stamps} == {day}
+    buckets = {int((ts - lo).total_seconds() // 3600) for ts in stamps}
+    assert buckets == set(range(expected))
 
 
 def test_events_layer_alone_on_hand_built_customers():

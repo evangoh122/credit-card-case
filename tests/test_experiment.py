@@ -304,6 +304,36 @@ def test_tenure_rejects_null_time_zone():
         tenure_outcomes(events, assignment, dim, 5, as_of_date=date(2026, 1, 7))
 
 
+def test_tenure_rejects_null_customer_ids():
+    events, assignment, dim = _tenure_frames()
+    null_events = events.with_columns(pl.lit(None, dtype=pl.String).alias("customer_id"))
+    with pytest.raises(ValueError, match="events customer_id must not contain nulls"):
+        tenure_outcomes(null_events, assignment, dim, 5, as_of_date=date(2026, 1, 7))
+
+    null_assignment = assignment.with_columns(pl.lit(None, dtype=pl.String).alias("customer_id"))
+    with pytest.raises(ValueError, match="assignment customer_id must not contain nulls"):
+        tenure_outcomes(events, null_assignment, dim, 5, as_of_date=date(2026, 1, 7))
+
+    null_dim = dim.with_columns(pl.lit(None, dtype=pl.String).alias("customer_id"))
+    with pytest.raises(ValueError, match="dim_customer customer_id must not contain nulls"):
+        tenure_outcomes(events, assignment, null_dim, 5, as_of_date=date(2026, 1, 7))
+
+
+def test_tenure_accepts_empty_events_and_assignment():
+    _, assignment, dim = _tenure_frames()
+    events = pl.DataFrame(
+        schema={
+            "customer_id": pl.String,
+            "event_ts_utc": pl.Datetime("us", "UTC"),
+        }
+    )
+    result = tenure_outcomes(events, assignment, dim, 5, as_of_date=date(2026, 1, 7))
+    assert result.row(0, named=True)["event_count"] == 0
+    assert result.row(0, named=True)["outcome"] == 0
+    empty = tenure_outcomes(events, assignment.clear(), dim, 5, as_of_date=date(2026, 1, 7))
+    assert empty.height == 0
+
+
 def test_tenure_outcomes_enforces_window_and_maturity_boundaries() -> None:
     assignment = pl.DataFrame(
         {

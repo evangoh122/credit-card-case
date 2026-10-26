@@ -54,19 +54,38 @@ def _zone_cutoffs(snapshot_date: date, zones: pl.Series) -> pl.DataFrame:
     )
 
 
-def _local_dates(frame: pl.DataFrame, dim_customer: pl.DataFrame) -> pl.DataFrame:
-    _require_columns(frame, {"customer_id", "event_ts_utc"}, "fact")
+def _validate_dim_customer(dim_customer: pl.DataFrame) -> None:
     _require_columns(dim_customer, {"customer_id", "tz"}, "dim_customer")
     dim_ids = dim_customer.get_column("customer_id")
+    if dim_ids.null_count():
+        raise ValueError("dim_customer customer_id must not contain nulls")
     if dim_ids.n_unique() != dim_customer.height:
         raise ValueError("dim_customer customer_id must be unique")
     validate_zones(dim_customer.get_column("tz"))
-    fact_ids = frame.get_column("customer_id").unique()
-    unknown = fact_ids.filter(~fact_ids.is_in(dim_ids.implode()))
-    if len(unknown):
+
+
+def _validate_fact_coverage(
+    frame: pl.DataFrame, dim_customer: pl.DataFrame, frame_name: str
+) -> None:
+    _require_columns(frame, {"customer_id"}, frame_name)
+    if frame.get_column("customer_id").null_count():
+        raise ValueError(f"{frame_name} customer_id must not contain nulls")
+    unknown = (
+        frame.select("customer_id")
+        .unique()
+        .join(dim_customer.select("customer_id"), on="customer_id", how="anti")
+    )
+    if unknown.height:
         raise ValueError(
-            f"fact customer_ids missing from dim_customer: {sorted(unknown.to_list(), key=str)[:5]}"
+            f"{frame_name} customer_ids missing from dim_customer: "
+            f"{sorted(unknown.get_column('customer_id').to_list(), key=str)[:5]}"
         )
+
+
+def _local_dates(frame: pl.DataFrame, dim_customer: pl.DataFrame) -> pl.DataFrame:
+    _require_columns(frame, {"customer_id", "event_ts_utc"}, "fact")
+    _validate_dim_customer(dim_customer)
+    _validate_fact_coverage(frame, dim_customer, "fact")
     return frame.join(
         dim_customer.select("customer_id", "tz"), on="customer_id", how="inner"
     ).with_columns(local_date_expr("event_ts_utc", "tz").alias("event_local_date"))
@@ -189,8 +208,8 @@ def rfm_snapshot(
         raise ValueError(f"dim_customer missing columns: {sorted(missing)}")
     if missing := required_txn.difference(fact_transactions.columns):
         raise ValueError(f"fact_transactions missing columns: {sorted(missing)}")
-    if dim_customer.get_column("customer_id").n_unique() != dim_customer.height:
-        raise ValueError("dim_customer customer_id must be unique")
+    _validate_dim_customer(dim_customer)
+    _validate_fact_coverage(fact_transactions, dim_customer, "fact_transactions")
 
     dim = dim_customer.select("customer_id", "tz", "joined_ts_utc").with_columns(
         local_date_expr("joined_ts_utc", "tz").alias("join_local_date")
@@ -245,8 +264,8 @@ def engagement_features(
     required = {"customer_id", "event_type", "event_ts_utc"}
     if missing := required.difference(fact_events.columns):
         raise ValueError(f"fact_events missing columns: {sorted(missing)}")
-    if "tz" not in dim_customer.columns:
-        raise ValueError("dim_customer missing columns: ['tz']")
+    _validate_dim_customer(dim_customer)
+    _validate_fact_coverage(fact_events, dim_customer, "fact_events")
     events = _local_dates(fact_events, dim_customer)
     cutoffs = _zone_cutoffs(snapshot_date, events.get_column("tz"))
     filtered = events.join(cutoffs, on="tz", how="left").filter(
@@ -297,6 +316,8 @@ def count_late_events(
     required = {"customer_id", "event_ts_utc", "loaded_at"}
     if missing := required.difference(events.columns):
         raise ValueError(f"events missing columns: {sorted(missing)}")
+    _validate_dim_customer(dim_customer)
+    _validate_fact_coverage(events, dim_customer, "events")
     local = _local_dates(events, dim_customer)
     previous = _zone_cutoffs(previous_snapshot_date, local.get_column("tz")).rename(
         {"cutoff_utc": "previous_cutoff_utc"}

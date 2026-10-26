@@ -408,16 +408,23 @@ def tenure_outcomes(
         if missing := required.difference(frame.columns):
             raise ValueError(f"{name} missing columns: {sorted(missing)}")
     dim_ids = dim_customer.get_column("customer_id")
+    if dim_ids.null_count():
+        raise ValueError("dim_customer customer_id must not contain nulls")
     if dim_ids.n_unique() != dim_customer.height:
         raise ValueError("dim_customer customer_id must be unique")
     validate_zones(dim_customer.get_column("tz"))
     for name, frame in (("assignment", assignment), ("events", events)):
-        ids = frame.get_column("customer_id").unique()
-        unknown = ids.filter(~ids.is_in(dim_ids.implode()))
-        if len(unknown):
+        if frame.get_column("customer_id").null_count():
+            raise ValueError(f"{name} customer_id must not contain nulls")
+        unknown = (
+            frame.select("customer_id")
+            .unique()
+            .join(dim_customer.select("customer_id"), on="customer_id", how="anti")
+        )
+        if unknown.height:
             raise ValueError(
                 f"{name} customer_ids missing from dim_customer: "
-                f"{sorted(unknown.to_list(), key=str)[:5]}"
+                f"{sorted(unknown.get_column('customer_id').to_list(), key=str)[:5]}"
             )
     base = assignment.with_columns(
         (pl.lit(as_of_date) < pl.col("assigned_date") + pl.duration(days=window_days - 1)).alias(
