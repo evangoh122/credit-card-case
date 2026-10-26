@@ -3,6 +3,7 @@ import math
 import polars as pl
 
 from ccc.sim import run
+from ccc.timeutil import local_datetime_expr
 
 SEEDS = (101, 102, 103, 104, 105)
 Z = 3.0
@@ -12,10 +13,12 @@ DAYS = 12
 def estimate(tables, campaign, sc):
     c = next(c for c in sc.campaigns if c.name == campaign)
     truth = tables["sim_truth_customer"]
-    buys = tables["fact_transactions"].filter(
-        (pl.col("txn_type") == "purchase")
-        & (pl.col("event_ts_utc") >= c.start_utc)
-        & (pl.col("event_ts_utc") < c.end_utc)
+    buys = (
+        tables["fact_transactions"]
+        .filter(pl.col("txn_type") == "purchase")
+        .join(tables["dim_customer"].select("customer_id", "tz"), on="customer_id")
+        .with_columns(local_datetime_expr("event_ts_utc", "tz").alias("local_ts"))
+        .filter((pl.col("local_ts") >= c.start_local_dt) & (pl.col("local_ts") < c.end_local_dt))
     )
     counts = buys.group_by("customer_id").len()
     df = (

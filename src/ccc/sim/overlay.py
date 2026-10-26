@@ -4,7 +4,6 @@ import polars as pl
 
 from ccc.rng import unit_hash
 from ccc.sim.scenario import Campaign, Scenario
-from ccc.timeutil import utc_to_et_date
 
 
 @dataclass(frozen=True)
@@ -32,7 +31,7 @@ def day_multipliers(sc: Scenario, d) -> DayMults:
 def arrival_multiplier(sc: Scenario, d) -> float:
     mult = 1.0
     for c in sc.campaigns:
-        if c.start_date_et <= d < utc_to_et_date(c.end_utc):
+        if c.start_local_date <= d < c.end_local_date:
             mult *= 1 + c.arrival_boost
     return mult
 
@@ -56,7 +55,7 @@ def assign_campaigns(seed: int, sc: Scenario, customers: pl.DataFrame) -> pl.Dat
     out = customers
     ids = customers["customer_id"].to_list()
     for c in sc.campaigns:
-        start_day = (c.start_date_et - sc.start_date).days
+        start_day = (c.start_local_date - sc.start_date).days
         eligible = out.select(_eligible(c, start_day).alias("e"))["e"]
         u = pl.Series([unit_hash(seed, f"campaign:{c.name}", cid) for cid in ids])
         arm = (

@@ -7,7 +7,7 @@ from scipy.stats import beta
 from ccc.rng import entity_rng
 from ccc.sim.overlay import arrival_multiplier, day_multipliers
 from ccc.sim.scenario import Scenario
-from ccc.timeutil import sim_date, utc_to_et_date, window_bounds_utc
+from ccc.timeutil import local_day_bounds_utc, sim_date
 
 DATA_LABEL = "synthetic"
 
@@ -23,7 +23,7 @@ EVENT_SCHEMA = {
     "customer_id": pl.String,
     "event_type": pl.String,
     "event_ts_utc": pl.Datetime("us", "UTC"),
-    "event_date_et": pl.Date,
+    "event_date_utc": pl.Date,
 }
 TXN_SCHEMA = {
     "transaction_id": pl.String,
@@ -31,7 +31,7 @@ TXN_SCHEMA = {
     "txn_type": pl.String,
     "amount": pl.Float64,
     "event_ts_utc": pl.Datetime("us", "UTC"),
-    "event_date_et": pl.Date,
+    "event_date_utc": pl.Date,
 }
 
 
@@ -66,7 +66,7 @@ def _frac(instant: datetime, lo: datetime, hi: datetime) -> float:
 
 def _stamp(lo: datetime, total_s: int, u: float) -> tuple[datetime, date]:
     ts = lo + timedelta(seconds=min(total_s - 1, int(u * total_s)))
-    return ts, utc_to_et_date(ts)
+    return ts, ts.date()
 
 
 def simulate_events(
@@ -74,28 +74,36 @@ def simulate_events(
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """customers needs: customer_id, join_day, risk, spend_rate, utilisation, and the
     `<campaign>_arm` / `<campaign>_true_lift` columns from overlay.assign_campaigns."""
+    required = {"customer_id", "join_day", "risk", "spend_rate", "utilisation", "tz"}
+    if missing := required.difference(customers.columns):
+        raise ValueError(f"customers missing columns: {sorted(missing)}")
     rows = customers.to_dicts()
     events: list[tuple] = []
     txns: list[tuple] = []
 
     for offset in range(days):
         d = sim_date(sc.start_date, offset)
-        lo, hi = window_bounds_utc(d, 1)
-        total_s = int((hi - lo).total_seconds())
         mult = day_multipliers(sc, d)
         wd = d.weekday()
         pay_mult = 1.0 if wd < 5 else WEEKEND_PAYMENT_MULT
-        windows = []
-        for c in sc.campaigns:
-            a = float(_cdf(_frac(c.start_utc, lo, hi)))
-            b = float(_cdf(_frac(c.end_utc, lo, hi)))
-            if b > a:
-                windows.append((c, a, b))
+        zone_windows = {}
+        for tz in {r["tz"] for r in rows}:
+            lo, hi = local_day_bounds_utc(d, tz)
+            total_s = int((hi - lo).total_seconds())
+            windows = []
+            for c in sc.campaigns:
+                start, end = c.local_bounds_utc(tz)
+                a = float(_cdf(_frac(start, lo, hi)))
+                b = float(_cdf(_frac(end, lo, hi)))
+                if b > a:
+                    windows.append((c, a, b))
+            zone_windows[tz] = (lo, total_s, windows)
 
         for r in rows:
             if r["join_day"] > offset:
                 continue
             cid = r["customer_id"]
+            lo, total_s, windows = zone_windows[r["tz"]]
             rng = entity_rng(seed, "behavior", cid, d)
             lam_open = open_rate(r["spend_rate"]) * OPEN_WEEKDAY[wd] * mult.app_open
             lam_buy = purchase_rate(r["spend_rate"]) * PURCHASE_WEEKDAY[wd] * mult.purchase

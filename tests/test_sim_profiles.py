@@ -4,9 +4,11 @@ import numpy as np
 import polars as pl
 import pytest
 
+from ccc.geo import CITIES, assign_city
 from ccc.sim import profiles
 from ccc.sim.run import NO_SHIFT
 from ccc.sim.scenario import CohortShift
+from ccc.timeutil import utc_to_local_date
 
 
 def table(seed, ids, day=0, shift=NO_SHIFT):
@@ -31,6 +33,13 @@ def test_latent_correlations_have_expected_signs():
     assert c[1, 3] > 0.1
 
 
+def test_city_assignment_is_seeded_and_stable_when_customers_are_added():
+    original = [assign_city(3, f"c{i}") for i in range(50)]
+    extended = [assign_city(3, f"c{i}") for i in range(200)]
+    assert extended[:50] == original
+    assert all(city in CITIES for city in original)
+
+
 def test_profile_depends_only_on_own_id():
     alone = table(3, ["c1"])
     crowd = table(3, ["c0", "c1", "c2"]).filter(pl.col("customer_id") == "c1")
@@ -52,11 +61,15 @@ def test_channel_probs_are_a_distribution():
     assert p.sum() == pytest.approx(1.0) and p.max() <= 0.8 + 1e-9
 
 
-def test_identities_are_seeded_and_dated():
+def test_identities_are_seeded_and_dated_in_utc():
     ids = [("c1", -10), ("c2", 3)]
     a = profiles.identities(7, ids, date(2026, 10, 19))
     assert a.equals(profiles.identities(7, ids, date(2026, 10, 19)))
-    assert a["join_date"].to_list() == [date(2026, 10, 9), date(2026, 10, 22)]
+    assert a["joined_ts_utc"].dtype == pl.Datetime("us", "UTC")
+    assert [
+        utc_to_local_date(ts, tz)
+        for ts, tz in zip(a["joined_ts_utc"].to_list(), a["tz"].to_list(), strict=True)
+    ] == [date(2026, 10, 9), date(2026, 10, 22)]
     assert not a["name"].equals(profiles.identities(8, ids, date(2026, 10, 19))["name"])
     assert a["name"][0] == profiles.identities(7, ids[:1], date(2026, 10, 19))["name"][0]
 
