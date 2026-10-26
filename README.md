@@ -16,3 +16,7 @@ uv run ruff check . && uv run ruff format --check .
 - `ccc.sim`: seeded simulator (profiles, events, scenario overlay). Run
   `uv run python -m ccc.sim --seed 1 --days 60 --scenario scenarios/default.toml --out data/sim`.
   Tests that fit SDV are marked `slow` (`uv run pytest -m slow`).
+- `ccc.tracking`, `python -m ccc.run_study`: logs a seeded study to MLflow (parent run per study,
+  child per seed) and checks planted campaign effects are recovered across seeds. Run
+  `uv run python -m ccc.run_study --scenario scenarios/default.toml --seeds 1 2 3 --n-initial 300`;
+  the store is `./mlruns` (gitignored); `--sdv-scores` needs `--profiles copula`.
