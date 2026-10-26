@@ -3,7 +3,7 @@
 ## Review feedback attribution
 
 This project collects review feedback from multiple AI models across build
-iterations (see `feedback.md`, `feedback_v5.md`, `feedback_v6.md`, and
+iterations (see `docs/archive/feedback.md`, `docs/archive/feedback_v5.md`, `docs/archive/feedback_v6.md`, and
 `hand_off_v*.md`'s "Reviews answered" line). Every `feedback_*.md` file must open
 with a header block identifying which model actually produced it:
 

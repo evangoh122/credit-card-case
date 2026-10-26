@@ -10,7 +10,7 @@
 **Reviewing model:** MiMo-V2.6-Pro (Xiaomi MiMo V2.6 Pro — provider
 `xiaomi-token-plan-sgp`, model ID `mimo-v2.6-pro`)
 **Date:** 2026-10-25, ~22:20 +08:00 (Asia/Singapore)
-**Matching reviews:** `feedback_v8.md` (MiMo section), `feedback_v7.md`
+**Matching reviews:** `docs/archive/feedback_v8.md` (MiMo section), `docs/archive/feedback_v7.md`
 **Evidence basis:** this hand-off contains **no v10 measurements**. Every v6
 figure below is a measurement of the v6 artifact cited to its source; everything
 else is proposal-tier and labelled as such.
@@ -21,10 +21,10 @@ else is proposal-tier and labelled as such.
 
 | Version | State | Evidence |
 |---|---|---|
-| v6 | released at the built-in gate: exit 0 · 143 PASS / 17 INFO / 0 FAIL · `released: true`; **disputed** — settlement cash reuse (measured) and two documentation hashes drift from the manifest (measured) | `credit_card_data_v6/release_manifest.json`, `feedback_v7.md`, `feedback_v8.md` |
-| v7 | planned; no artifact | `hand_off_v7.md` |
-| v8 | planned; no artifact | `hand_off_v8.md` |
-| v9 | planned; no artifact | `hand_off_v9.md` |
+| v6 | released at the built-in gate: exit 0 · 143 PASS / 17 INFO / 0 FAIL · `released: true`; **disputed** — settlement cash reuse (measured) and two documentation hashes drift from the manifest (measured) | `credit_card_data_v6/release_manifest.json`, `docs/archive/feedback_v7.md`, `docs/archive/feedback_v8.md` |
+| v7 | planned; no artifact | `docs/archive/hand_off_v7.md` |
+| v8 | planned; no artifact | `docs/archive/hand_off_v8.md` |
+| v9 | planned; no artifact | `docs/archive/hand_off_v9.md` |
 | v10 | planned; no artifact | this document |
 
 Measured v6 facts quoted above, with sources:
@@ -33,22 +33,22 @@ Measured v6 facts quoted above, with sources:
   re-derived directly from the report);
 - settlement: **47,367 of 54,369 accounts (87.12%)** over-report settlement;
   aggregate `paid_closing_amount` $2.18B vs card cash $1.60B (**$579M excess**);
-  max per-account excess $205,952 — `feedback_v7.md` / `feedback_v8.md` (MiMo);
+  max per-account excess $205,952 — `docs/archive/feedback_v7.md` / `docs/archive/feedback_v8.md` (MiMo);
 - documentation integrity: `data_dictionary.csv` and `data_dictionary.md`
   SHA-256 **MISMATCH** `release_manifest.json`; the other 6 documented files
-  match — `feedback_v8.md` (Codex, independently reproduced by MiMo);
+  match — `docs/archive/feedback_v8.md` (Codex, independently reproduced by MiMo);
 - statement continuity: `opening(i+1) = closing(i)` holds at $0.00 across 530,594
   rolls; the falsified form `closing(i) - payments(i+1)` shows max residual
-  $80,026.51 — `feedback_v7.md` (MiMo).
+  $80,026.51 — `docs/archive/feedback_v7.md` (MiMo).
 
 ---
 
-## 2. What changed since `hand_off_v9.md`
+## 2. What changed since `docs/archive/hand_off_v9.md`
 
 | Change | Evidence tier |
 |---|---|
-| MiMo plan review appended to `feedback_v8.md` (concurring with Codex/Kimi; added findings A1–A5) | document inspection + measurement |
-| v6 documentation hash drift independently reproduced and attributed to the post-build `refresh_docs` run recorded in `feedback_v6.md` §6 | direct measurement |
+| MiMo plan review appended to `docs/archive/feedback_v8.md` (concurring with Codex/Kimi; added findings A1–A5) | document inspection + measurement |
+| v6 documentation hash drift independently reproduced and attributed to the post-build `refresh_docs` run recorded in `docs/archive/feedback_v6.md` §6 | direct measurement |
 | Settlement defect quantified at scale (figures above) | direct measurement |
 | This next-numbered planned hand-off created to continue the chain | documentation only |
 
