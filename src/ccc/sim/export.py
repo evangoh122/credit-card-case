@@ -108,9 +108,45 @@ def export(
     include_truth: bool = False,
     memory_limit: str = "4GB",
 ) -> dict:
-    """Write the dataset under `out` and return the manifest (also saved as manifest.json)."""
+    """Write the dataset under `out` and return the manifest (also saved as manifest.json).
+
+    `out` must be absent or empty. On any failure everything this run wrote is removed.
+    """
     if out.exists() and any(out.iterdir()):
         raise FileExistsError(f"{out} is not empty")
+    created = not out.exists()
+    try:
+        return _export(
+            out,
+            seed,
+            days,
+            sc,
+            target_transactions,
+            batch_size,
+            workers,
+            include_truth,
+            memory_limit,
+        )
+    except BaseException:
+        if created:
+            shutil.rmtree(out, ignore_errors=True)
+        else:  # out was empty on entry, so every child was written by this run
+            for child in out.iterdir():
+                shutil.rmtree(child, ignore_errors=True) if child.is_dir() else child.unlink()
+        raise
+
+
+def _export(
+    out: Path,
+    seed: int,
+    days: int,
+    sc: scenario.Scenario,
+    target_transactions: int | None,
+    batch_size: int,
+    workers: int | None,
+    include_truth: bool,
+    memory_limit: str,
+) -> dict:
     t0 = time.time()
     if target_transactions is not None:
         sc = replace(
@@ -121,48 +157,54 @@ def export(
     tables = [*FACTS, "dim_customer", *(["sim_truth_customer"] if include_truth else [])]
 
     staging = out / ".staging"
-    for name in tables:
-        (staging / name).mkdir(parents=True)
-    batches = [specs[i : i + batch_size] for i in range(0, len(specs), batch_size)]
-    jobs = [(i, seed, days, sc, b, loaded_at, staging, tables) for i, b in enumerate(batches)]
-    workers = workers or os.cpu_count() or 1
-    staged = dict.fromkeys(tables, 0)
-    with ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn")) as pool:
-        for counts in pool.map(_write_batch, jobs):
-            for name, n in counts.items():
-                staged[name] += n
+    con = None
+    try:
+        for name in tables:
+            (staging / name).mkdir(parents=True)
+        batches = [specs[i : i + batch_size] for i in range(0, len(specs), batch_size)]
+        jobs = [(i, seed, days, sc, b, loaded_at, staging, tables) for i, b in enumerate(batches)]
+        workers = workers or os.cpu_count() or 1
+        staged = dict.fromkeys(tables, 0)
+        with ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn")) as pool:
+            for counts in pool.map(_write_batch, jobs):
+                for name, n in counts.items():
+                    staged[name] += n
 
-    con = duckdb.connect()
-    con.execute(f"SET memory_limit = '{memory_limit}'")
-    con.execute(f"SET temp_directory = '{staging / 'duckdb_tmp'}'")
-    con.execute("SET TimeZone = 'UTC'")
-    con.execute("SET threads = 1")  # one writer per partition: one file per day, not one per thread
-    for name in tables:
-        src = f"read_parquet('{staging / name}/*.parquet')"
-        keys = ", ".join(FACTS.get(name) or (DIMS[name],))
-        if name in FACTS:
-            con.execute(
-                f"COPY (SELECT * FROM {src} ORDER BY {keys}) TO '{out / name}' "
-                "(FORMAT parquet, COMPRESSION zstd, PARTITION_BY (event_date_utc), "
-                "WRITE_PARTITION_COLUMNS true)"
-            )
-        else:
-            con.execute(
-                f"COPY (SELECT * FROM {src} ORDER BY {keys}) TO '{out / name}.parquet' "
-                "(FORMAT parquet, COMPRESSION zstd)"
-            )
-    shutil.rmtree(staging)
+        con = duckdb.connect()
+        con.execute(f"SET memory_limit = '{memory_limit}'")
+        con.execute(f"SET temp_directory = '{staging / 'duckdb_tmp'}'")
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("SET threads = 1")  # one writer per partition: one file per day
+        for name in tables:
+            src = f"read_parquet('{staging / name}/*.parquet')"
+            keys = ", ".join(FACTS.get(name) or (DIMS[name],))
+            if name in FACTS:
+                con.execute(
+                    f"COPY (SELECT * FROM {src} ORDER BY {keys}) TO '{out / name}' "
+                    "(FORMAT parquet, COMPRESSION zstd, PARTITION_BY (event_date_utc), "
+                    "WRITE_PARTITION_COLUMNS true)"
+                )
+            else:
+                con.execute(
+                    f"COPY (SELECT * FROM {src} ORDER BY {keys}) TO '{out / name}.parquet' "
+                    "(FORMAT parquet, COMPRESSION zstd)"
+                )
+        shutil.rmtree(staging)
 
-    counts = {}
-    for name in tables:
-        glob = f"{out / name}/*/*.parquet" if name in FACTS else f"{out / name}.parquet"
-        counts[name] = con.execute(f"SELECT count(*) FROM read_parquet('{glob}')").fetchone()[0]
-    if counts != staged:
-        raise RuntimeError(f"written row counts {counts} differ from generated {staged}")
-    dates = con.execute(
-        f"SELECT min(event_date_utc), max(event_date_utc) "
-        f"FROM read_parquet('{out / 'fact_transactions'}/*/*.parquet')"
-    ).fetchone()
+        counts = {}
+        for name in tables:
+            glob = f"{out / name}/*/*.parquet" if name in FACTS else f"{out / name}.parquet"
+            counts[name] = con.execute(f"SELECT count(*) FROM read_parquet('{glob}')").fetchone()[0]
+        if counts != staged:
+            raise RuntimeError(f"written row counts {counts} differ from generated {staged}")
+        dates = con.execute(
+            f"SELECT min(event_date_utc), max(event_date_utc) "
+            f"FROM read_parquet('{out / 'fact_transactions'}/*/*.parquet')"
+        ).fetchone()
+    finally:
+        if con is not None:
+            con.close()
+        shutil.rmtree(staging, ignore_errors=True)
     manifest = {
         "data_label": events.DATA_LABEL,
         "timezone": "UTC",
