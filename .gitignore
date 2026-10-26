@@ -14,3 +14,15 @@ wheels/
 *REVIEW_GUIDE.MD*
 .pytest_cache/
 _stash_*/
+
+# Local-only working files (never part of a PR)
+plans/
+evidence/builder_provenance.txt
+evidence/deepseek-*.out
+/build_v*_log.txt
+/build_v*_run.log
+/build_*log*.txt
+/*_wrapper.log
+/*.log
+run_release.sh
+mtime-test-*/
