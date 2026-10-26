@@ -1,0 +1,37 @@
+name = "default"
+start_date = 2026-10-19
+initial_customers = 2000
+arrivals_per_day = 40.0
+arrivals_trend = 0.005
+
+[[campaigns]]
+name = "welcome_cashback"
+start_et = "2026-10-24T09:00:00"
+duration_days = 14
+lift = 0.35
+arrival_boost = 0.25
+
+[campaigns.segment]
+risk_max = 0.7
+
+[[campaigns]]
+name = "null_email"
+start_et = "2026-11-10T09:00:00"
+duration_days = 14
+lift = 0.0
+
+[payday]
+days_of_month = [1, 15]
+
+[macro_shock]
+start_date = 2026-11-16
+miss_mult = 2.0
+ramp_days = 14
+
+[fee_change]
+date = 2026-11-23
+purchase_mult = 0.92
+
+[cohort_shift]
+paid_share_per_day = 0.004
+risk_z_per_day = 0.01
