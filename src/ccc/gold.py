@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -20,6 +21,7 @@ from ccc.timeutil import snapshot_cutoff_utc
 
 LOGGER = logging.getLogger(__name__)
 RFM_METRICS = ("recency", "frequency", "monetary")
+# Utilisation exists in simulator truth but is also an approved production segmentation feature.
 TRUTH_COLUMNS = {"cohort_day", "risk", "spend_rate", "responsiveness"}
 
 
@@ -65,6 +67,8 @@ class RFMBins:
                 raise ValueError(f"{metric} must have five ordered score bins")
             if edges[0] != float("-inf") or edges[-1] != float("inf"):
                 raise ValueError(f"{metric} outer bin edges must be infinite")
+            if not all(math.isfinite(edge) for edge in edges[1:-1]):
+                raise ValueError(f"{metric} inner bin edges must be finite")
 
     def save(self, path: str | Path) -> None:
         payload = {metric: [None, *self.edges[metric][1:-1], None] for metric in RFM_METRICS}
@@ -179,10 +183,14 @@ def rfm_snapshot(
         else:
             aggregate = in_window.group_by("customer_id").agg(pl.col("amount").sum().alias(metric))
         result = result.join(aggregate, on="customer_id", how="left")
-    result = result.with_columns(
-        pl.col("frequency").fill_null(0),
-        pl.col("monetary").fill_null(0.0),
-    ).drop("join_date")
+    result = (
+        result.with_columns(
+            pl.col("frequency").fill_null(0),
+            pl.col("monetary").fill_null(0.0),
+        )
+        .drop("join_date")
+        .sort("customer_id")
+    )
     return score_rfm(result, bins) if bins is not None else result
 
 

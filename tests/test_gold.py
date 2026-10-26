@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
 import pytest
@@ -56,6 +56,7 @@ def _transactions() -> pl.DataFrame:
 
 def test_rfm_is_point_in_time_and_left_joined():
     result = rfm_snapshot(_customers(), _transactions(), date(2026, 11, 1), WINDOWS)
+    assert result["customer_id"].to_list() == ["a", "b"]
     a = result.filter(pl.col("customer_id") == "a").row(0, named=True)
     b = result.filter(pl.col("customer_id") == "b").row(0, named=True)
     assert (a["recency"], a["frequency"], a["monetary"]) == (0, 2, 30.0)
@@ -86,7 +87,7 @@ def test_rfm_windows_use_calendar_dates_across_dst_fallback():
     windows = {"recency": 2, "frequency": 2, "monetary": 2}
     result = rfm_snapshot(_customers(), transactions, date(2026, 11, 1), windows)
     row = result.filter(pl.col("customer_id") == "a").row(0, named=True)
-    assert (row["frequency"], row["monetary"]) == (2, 60.0)
+    assert (row["recency"], row["frequency"], row["monetary"]) == (0, 2, 60.0)
 
 
 def test_saved_bins_are_reused_without_refitting(tmp_path):
@@ -147,6 +148,13 @@ def test_rfm_scores_constant_reference_at_lowest_level():
     assert scored["recency_score"].unique().to_list() == [5]
     assert scored["frequency_score"].unique().to_list() == [1]
     assert scored["monetary_score"].unique().to_list() == [1]
+
+
+def test_rfm_bins_reject_nan_edges():
+    valid = (-float("inf"), 1.0, 2.0, 3.0, 4.0, float("inf"))
+    invalid = (-float("inf"), 1.0, float("nan"), 3.0, 4.0, float("inf"))
+    with pytest.raises(ValueError, match="finite"):
+        RFMBins({"recency": invalid, "frequency": valid, "monetary": valid})
 
 
 def test_engagement_is_separate_from_rfm():
@@ -229,19 +237,26 @@ def test_store_is_idempotent_frozen_and_adds_loaded_at(tmp_path):
 def test_late_events_are_counted_and_logged_for_next_snapshot(tmp_path):
     previous = date(2026, 11, 1)
     current = date(2026, 11, 2)
+    previous_cutoff = snapshot_cutoff_utc(previous)
+    current_cutoff = snapshot_cutoff_utc(current)
+    assert previous_cutoff == datetime(2026, 11, 2, 4, 59, 59, tzinfo=UTC)
+    assert current_cutoff == datetime(2026, 11, 3, 4, 59, 59, tzinfo=UTC)
     events = pl.DataFrame(
         {
-            "event_date_et": [previous] * 5,
+            "event_date_et": [previous, previous, previous, previous, previous, current],
             "loaded_at": [
-                snapshot_cutoff_utc(previous),
-                datetime(2026, 11, 2, 6, tzinfo=UTC),
-                snapshot_cutoff_utc(current),
-                datetime(2026, 11, 3, 5, 0, tzinfo=UTC),
-                datetime(2026, 11, 1, 12, tzinfo=UTC),
+                previous_cutoff,
+                previous_cutoff + timedelta(hours=1),
+                current_cutoff,
+                current_cutoff + timedelta(seconds=1),
+                previous_cutoff - timedelta(hours=1),
+                previous_cutoff + timedelta(hours=2),
             ],
         },
         schema_overrides={"loaded_at": pl.Datetime("us", "UTC")},
     )
+    assert events["loaded_at"].item(0) == previous_cutoff
+    assert events["loaded_at"].item(2) == current_cutoff
     count = count_late_events(events, previous, current)
     assert count == 2
     store = GoldStore(tmp_path)
@@ -301,7 +316,7 @@ def test_experiment_assignment_writer_reuses_assignment_contract(tmp_path):
     )
     assert result["customer_id"].to_list() == ["a"]
     assert result["experiment_id"].to_list() == ["offer_1"]
-    assert result["arm"].to_list() == ["control"] or result["arm"].to_list() == ["test"]
+    assert result["arm"].to_list() == ["control"]
     assert "loaded_at" in result.columns
     again = store.write_experiment_assignment(
         segments, "offer_1", 7, assigned_date=date(2026, 11, 1)
@@ -355,6 +370,20 @@ def test_truth_guard_is_called_by_every_feature_and_writer_entrypoint(tmp_path):
         make_rfm_bins(
             pl.DataFrame({"recency": [1], "frequency": [1], "monetary": [1]}).with_columns(truth)
         )
+    bins = make_rfm_bins(
+        pl.DataFrame(
+            {
+                "recency": [1, 2, 3, 4, 5],
+                "frequency": [1, 2, 3, 4, 5],
+                "monetary": [1, 2, 3, 4, 5],
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="simulation truth"):
+        score_rfm(
+            pl.DataFrame({"recency": [1], "frequency": [1], "monetary": [1]}).with_columns(truth),
+            bins,
+        )
     with pytest.raises(ValueError, match="simulation truth"):
         rfm_snapshot(
             _customers().with_columns(truth.extend_constant(0, 2)),
@@ -378,6 +407,16 @@ def test_truth_guard_is_called_by_every_feature_and_writer_entrypoint(tmp_path):
         segment_assignment_snapshot(features, model, date(2026, 11, 1))
     with pytest.raises(ValueError, match="simulation truth"):
         GoldStore(tmp_path).write_snapshot("features", features, ("customer_id",))
+    assignment_features = pl.DataFrame(
+        {"customer_id": ["a"], "segment": ["Prime"], "cohort_day": [0]}
+    )
+    with pytest.raises(ValueError, match="simulation truth"):
+        GoldStore(tmp_path).write_experiment_assignment(
+            assignment_features,
+            "offer",
+            1,
+            assigned_date=date(2026, 11, 1),
+        )
 
 
 def test_end_to_end_from_simulator():
