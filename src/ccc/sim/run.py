@@ -23,26 +23,38 @@ def cohort_specs(seed: int, sc: scenario.Scenario, days: int) -> list[tuple[str,
     return specs
 
 
-def simulate(
+def profile_model(seed: int, profile_source: str):
+    """Fitted copula for profile_source='copula' (shared across chunks), else None."""
+    if profile_source not in ("handwritten", "copula"):
+        raise ValueError("profile_source must be 'handwritten' or 'copula'")
+    if profile_source == "handwritten":
+        return None
+    seed_pairs = [(f"S-{i:05d}", 0) for i in range(SEED_TABLE_ROWS)]
+    seed_table = profiles.handwritten_table(seed, seed_pairs, NO_SHIFT)
+    return profiles.fit_copula(seed_table)
+
+
+def default_loaded_at(sc: scenario.Scenario, days: int) -> datetime:
+    last_local_date = sim_date(sc.start_date, days)
+    return max(local_day_bounds_utc(last_local_date, tz)[0] for tz in ZONES)
+
+
+def simulate_chunk(
     seed: int,
     days: int,
     sc: scenario.Scenario,
-    profile_source: str = "handwritten",
+    specs: list[tuple[str, int, int]],
+    loaded_at: datetime,
+    synth=None,
     locale: str = "en_US",
-    loaded_at: datetime | None = None,
 ) -> dict[str, pl.DataFrame]:
-    if loaded_at is not None and loaded_at.tzinfo is None:
-        raise ValueError("loaded_at must be timezone-aware")
-    if profile_source not in ("handwritten", "copula"):
-        raise ValueError("profile_source must be 'handwritten' or 'copula'")
-    specs = cohort_specs(seed, sc, days)
+    """Simulate one batch of `cohort_specs` rows. Every output row depends only on
+    (seed, its own customer), so any partition of the specs yields the same union of rows."""
     pairs = [(c, d) for c, d, _ in specs]
-    if profile_source == "handwritten":
+    if synth is None:
         prof = profiles.handwritten_table(seed, pairs, sc.cohort_shift)
     else:
-        seed_pairs = [(f"S-{i:05d}", 0) for i in range(SEED_TABLE_ROWS)]
-        seed_table = profiles.handwritten_table(seed, seed_pairs, NO_SHIFT)
-        prof = profiles.copula_table(profiles.fit_copula(seed_table), seed, pairs, sc.cohort_shift)
+        prof = profiles.copula_table(synth, seed, pairs, sc.cohort_shift)
     ident = profiles.identities(seed, [(c, j) for c, _, j in specs], sc.start_date, locale)
     customers = ident.join(prof, on="customer_id", how="inner", maintain_order="left")
     customers = customers.with_columns(
@@ -51,9 +63,6 @@ def simulate(
     customers = overlay.assign_campaigns(seed, sc, customers)
 
     txns, evts = events.simulate_events(seed, sc, customers, days)
-    if loaded_at is None:
-        last_local_date = sim_date(sc.start_date, days)
-        loaded_at = max(local_day_bounds_utc(last_local_date, tz)[0] for tz in ZONES)
 
     campaign_cols = [col for c in sc.campaigns for col in (f"{c.name}_arm", f"{c.name}_true_lift")]
     dim = customers.select(
@@ -74,6 +83,33 @@ def simulate(
         "fact_transactions": events.label(txns, loaded_at),
         "fact_events": events.label(evts, loaded_at),
     }
+
+
+def simulate(
+    seed: int,
+    days: int,
+    sc: scenario.Scenario,
+    profile_source: str = "handwritten",
+    locale: str = "en_US",
+    loaded_at: datetime | None = None,
+    batch_size: int | None = None,
+) -> dict[str, pl.DataFrame]:
+    """batch_size only bounds peak memory; the result is identical for every batch size."""
+    if loaded_at is not None and loaded_at.tzinfo is None:
+        raise ValueError("loaded_at must be timezone-aware")
+    synth = profile_model(seed, profile_source)
+    specs = cohort_specs(seed, sc, days)
+    if loaded_at is None:
+        loaded_at = default_loaded_at(sc, days)
+    step = batch_size or max(1, len(specs))
+    batches = [specs[i : i + step] for i in range(0, len(specs), step)] or [[]]
+    chunks = [simulate_chunk(seed, days, sc, b, loaded_at, synth) for b in batches]
+    if len(chunks) == 1:
+        return chunks[0]
+    out = {name: pl.concat([c[name] for c in chunks]) for name in chunks[0]}
+    out["fact_transactions"] = out["fact_transactions"].sort("event_ts_utc", "transaction_id")
+    out["fact_events"] = out["fact_events"].sort("event_ts_utc", "event_id")
+    return out
 
 
 def main(argv: list[str] | None = None) -> None:

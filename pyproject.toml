@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Credit card case: segmentation, offer experiments and drift monitoring on a seeded simulation"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "duckdb>=2.0.0",
     "faker>=40.43.0",
     "mlflow>=3.17.2",
     "numpy",
@@ -13,8 +14,14 @@ dependencies = [
     "sdv>=2.0.0",
 ]
 
+[project.optional-dependencies]
+hf = [
+    "huggingface-hub>=2.3.0",
+]
+
 [dependency-groups]
 dev = [
+    "nbformat>=5.11.1",
     "pytest",
     "ruff",
 ]
@@ -33,6 +40,7 @@ markers = ["slow: fits SDV synthesizers; run with -m slow"]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
