@@ -8,7 +8,7 @@ from scipy.optimize import brentq
 from scipy.stats import norm
 
 from ccc.rng import unit_hash
-from ccc.timeutil import local_date_expr
+from ccc.timeutil import local_date_expr, validate_zones
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_ARMS = {"control": 0.5, "test": 0.5}
@@ -395,9 +395,30 @@ def tenure_outcomes(
     """
     if window_days < 1:
         raise ValueError("window_days must be positive")
-    required = {"customer_id", "event_ts_utc"}
-    if missing := required.difference(events.columns):
-        raise ValueError(f"events missing columns: {sorted(missing)}")
+    checks = (
+        ("events", events, {"customer_id", "event_ts_utc"}),
+        ("dim_customer", dim_customer, {"customer_id", "tz"}),
+        (
+            "assignment",
+            assignment,
+            {"customer_id", "experiment_id", "arm", "assigned_date", "stratum"},
+        ),
+    )
+    for name, frame, required in checks:
+        if missing := required.difference(frame.columns):
+            raise ValueError(f"{name} missing columns: {sorted(missing)}")
+    dim_ids = dim_customer.get_column("customer_id")
+    if dim_ids.n_unique() != dim_customer.height:
+        raise ValueError("dim_customer customer_id must be unique")
+    validate_zones(dim_customer.get_column("tz"))
+    for name, frame in (("assignment", assignment), ("events", events)):
+        ids = frame.get_column("customer_id").unique()
+        unknown = ids.filter(~ids.is_in(dim_ids.implode()))
+        if len(unknown):
+            raise ValueError(
+                f"{name} customer_ids missing from dim_customer: "
+                f"{sorted(unknown.to_list(), key=str)[:5]}"
+            )
     base = assignment.with_columns(
         (pl.lit(as_of_date) < pl.col("assigned_date") + pl.duration(days=window_days - 1)).alias(
             "immature"

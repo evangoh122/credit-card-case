@@ -7,10 +7,19 @@ import polars as pl
 
 @cache
 def zone(tz: str) -> ZoneInfo:
+    if not isinstance(tz, str):
+        raise ValueError(f"unknown IANA time zone: {tz!r}")
     try:
         return ZoneInfo(tz)
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise ValueError(f"unknown IANA time zone: {tz!r}") from exc
+
+
+def validate_zones(zones: pl.Series) -> None:
+    if zones.null_count():
+        raise ValueError("time zone column must not contain nulls")
+    for name in zones.unique(maintain_order=True):
+        zone(name)
 
 
 def _aware(ts: datetime) -> datetime:
@@ -58,6 +67,7 @@ def _per_zone(values: pl.Series, *, dates: bool) -> pl.Series:
     zones = values.struct.field("tz")
     if stamps.dtype.time_zone is None:
         raise ValueError("timestamp column must be timezone-aware")
+    validate_zones(zones)
     parts = []
     for name in zones.unique(maintain_order=True):
         mask = zones == name

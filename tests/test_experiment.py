@@ -251,6 +251,59 @@ def test_overall_uplift_is_weighted_by_stratum_size_not_pooled_arm_mix() -> None
     assert overall["uplift"] != pytest.approx(0.52)
 
 
+def _tenure_frames():
+    assignment = pl.DataFrame(
+        {
+            "customer_id": ["a"],
+            "experiment_id": ["offer"],
+            "arm": ["test"],
+            "assigned_date": [date(2026, 1, 1)],
+            "stratum": ["Prime"],
+        }
+    )
+    dim = pl.DataFrame({"customer_id": ["a"], "tz": ["America/New_York"]})
+    events = pl.DataFrame(
+        {"customer_id": ["a"], "event_ts_utc": [datetime(2026, 1, 2, 15, tzinfo=UTC)]},
+        schema_overrides={"event_ts_utc": pl.Datetime("us", "UTC")},
+    )
+    return events, assignment, dim
+
+
+def test_tenure_rejects_assignment_without_dim_rows():
+    events, assignment, dim = _tenure_frames()
+    with pytest.raises(ValueError, match="assignment customer_ids missing from dim_customer"):
+        tenure_outcomes(
+            events,
+            assignment,
+            dim.filter(pl.col("customer_id") == "other"),
+            5,
+            as_of_date=date(2026, 1, 7),
+        )
+
+
+def test_tenure_rejects_events_without_dim_rows():
+    events, assignment, dim = _tenure_frames()
+    hidden = events.with_columns(pl.lit("ghost").alias("customer_id"))
+    with pytest.raises(ValueError, match="events customer_ids missing from dim_customer"):
+        tenure_outcomes(hidden, assignment, dim, 5, as_of_date=date(2026, 1, 7))
+
+
+def test_tenure_rejects_duplicate_dim_rows():
+    events, assignment, dim = _tenure_frames()
+    with pytest.raises(ValueError, match="customer_id must be unique"):
+        tenure_outcomes(events, assignment, pl.concat([dim, dim]), 5, as_of_date=date(2026, 1, 7))
+
+
+def test_tenure_rejects_null_time_zone():
+    events, assignment, dim = _tenure_frames()
+    dim = pl.DataFrame(
+        {"customer_id": ["a"], "tz": [None]},
+        schema_overrides={"tz": pl.String},
+    )
+    with pytest.raises(ValueError, match="must not contain nulls"):
+        tenure_outcomes(events, assignment, dim, 5, as_of_date=date(2026, 1, 7))
+
+
 def test_tenure_outcomes_enforces_window_and_maturity_boundaries() -> None:
     assignment = pl.DataFrame(
         {
