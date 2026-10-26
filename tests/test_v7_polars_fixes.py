@@ -88,7 +88,7 @@ def test_credit_default_features_exclude_label_columns(captured):
     tx = _tx(["C1", "C2"])
     tx["account_id"] = ["AC1", "AC2"]
     stmts["billed_amount"], stmts["payment_due_date"] = 2.0, OBS + pd.Timedelta(days=20)
-    alloc = pd.DataFrame({"statement_id": [], "allocation_date": [], "amount_usd": []})
+    alloc = pd.DataFrame({"account_id": [], "payment_date": [], "amount_usd": [], "payment_type": []})
     ml_extracts.build_credit_default(tx, accounts, _customers(), stmts, delinq, alloc)
     for name in ("credit_default_features", "credit_default_train", "credit_default_test"):
         if name in captured:
