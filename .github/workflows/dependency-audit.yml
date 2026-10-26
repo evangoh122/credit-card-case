@@ -1,0 +1,46 @@
+name: Dependency audit
+
+on:
+  pull_request:
+  schedule:
+    - cron: "41 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Fixable vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Export runtime dependencies
+        run: uv export --quiet --locked --no-dev --no-hashes --no-emit-project --output-file /tmp/requirements-audit.txt
+      - name: Audit dependencies
+        continue-on-error: ${{ github.event_name == 'schedule' }}
+        run: |
+          uvx --python 3.12 pip-audit --requirement /tmp/requirements-audit.txt --format json --output /tmp/audit.json || true
+          python - <<'PY'
+          import json
+          import sys
+
+          with open("/tmp/audit.json", encoding="utf-8") as report:
+              dependencies = json.load(report)["dependencies"]
+          fixable = [
+              (dependency["name"], vulnerability["id"], vulnerability["fix_versions"])
+              for dependency in dependencies
+              for vulnerability in dependency["vulns"]
+              if vulnerability["fix_versions"]
+          ]
+          for package, vulnerability, fixes in fixable:
+              print(f"{package}: {vulnerability} (fix: {', '.join(fixes)})")
+          sys.exit(bool(fixable))
+          PY
