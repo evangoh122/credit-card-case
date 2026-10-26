@@ -596,6 +596,7 @@ ML_FRAUD_LABEL_NOISE_FALSE_FLAG = 0.02          # non-fraud relabelled 1
 ML_OBSERVATION_DATE = dt.date(2026, 3, 31)      # credit/churn feature cut-off
 ML_OUTCOME_END = dt.date(2026, 9, 30)           # label outcome window end
 ML_FRAUD_OOT_START = dt.date(2026, 7, 1)        # final-quarter out-of-time test
+ML_FORECAST_TEST_START = dt.date(2026, 7, 1)      # forecast test window; seasonality/merchants use earlier months only
 ML_FRAUD_MAX_ROWS = 2_000_000                   # sampled non-fraud rows
 ML_FORECAST_MERCHANTS = 5_000                   # largest merchants by spend
 ML_PR_AUC_MAX = 0.95                            # realistic, not separable

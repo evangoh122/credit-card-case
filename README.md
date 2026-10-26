@@ -140,7 +140,11 @@ ML extracts keep label-defining columns (`customer_status`, `churn_date`,
 `ml_extracts.check_no_label_columns`. Credit-default `status_at_obs` / `paid_full_share_3m` are recomputed from
 payment allocations dated on or before the observation date (the final statement
 `payment_status` is settled with later cash); `max_source_date` includes payment
-dates. Tests: `tests/test_v7_asof_payments.py`. Tests: `tests/test_v7_polars_fixes.py`. Runtime ≈ 55 minutes for 50k customers.
+dates. Tests: `tests/test_v7_asof_payments.py`. Round 6: the status replay uses the simulator's own
+`_waterfall`/`_settled_closing_amounts`/`_stmt_status`; fraud velocity features are
+strictly as-of (running day count, trailing-7-day spend); the forecast extract has
+train/test months with merchant selection and `seasonal_index` from train months
+only (`C.ML_FORECAST_TEST_START`). Tests: `tests/test_v7_round6_asof_extracts.py`. Tests: `tests/test_v7_polars_fixes.py`. Runtime ≈ 55 minutes for 50k customers.
 
 ---
 

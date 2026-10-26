@@ -20,6 +20,7 @@ memory budget:
 """
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 from pathlib import Path
@@ -154,19 +155,44 @@ def _load_purchases() -> pd.DataFrame:
 
 
 def _attach_velocity(df: pd.DataFrame) -> pd.DataFrame:
-    """Customer-day count and customer-week spend, both point-in-time proxies."""
-    day = df.transaction_date.dt.normalize()
-    df = df.assign(_day=day, _week=df.transaction_date.dt.to_period("W").astype(str))
-    cd = (df.groupby(["customer_id", "_day"], sort=False).size()
-            .rename("customer_day_txn_count").reset_index())
-    cw = (df.groupby(["customer_id", "_week"], sort=False).amount_usd.sum()
-            .rename("customer_week_spend").reset_index())
-    first = df.groupby("customer_id", sort=False).transaction_date.min().rename("first_txn_date")
-    df = df.merge(cd, on=["customer_id", "_day"], how="left")
-    df = df.merge(cw, on=["customer_id", "_week"], how="left")
-    df = df.join(first, on="customer_id")
-    df["days_since_first_txn"] = (df.transaction_date - df.first_txn_date).dt.days
-    return df.drop(columns=["_day", "_week", "first_txn_date"])
+    """Strictly as-of velocity features: later transactions never change earlier rows.
+
+    Transactions of one customer are ordered by (``transaction_ts``,
+    ``transaction_id``); that order is the stable tiebreak for equal timestamps.
+
+    * ``customer_day_txn_count`` - this customer's transactions on the same
+      ``transaction_date`` up to and including the current one (running count).
+    * ``customer_week_spend`` - sum of this customer's ``amount_usd`` over the
+      trailing 7 days up to and including the current transaction, i.e.
+      timestamps in ``(ts - 7 days, ts]`` (a rolling window, not the calendar
+      week bucket, which needs the whole week).
+    * ``days_since_first_txn`` - days since the customer's first transaction
+      (always earlier than the current row, so it is as-of already).
+    """
+    cols = ["customer_id", "transaction_id", "transaction_ts", "transaction_date", "amount_usd"]
+    work = pl.from_pandas(df[cols].reset_index(drop=True)).with_row_index("_row")
+    work = work.sort(["customer_id", "transaction_ts", "transaction_id"])
+    # a strictly increasing key (1 ns steps among equal timestamps) makes the rolling
+    # window honour the (ts, id) tiebreak instead of including later rows with the same ts
+    key = (pl.col("transaction_ts")
+           + pl.duration(nanoseconds=pl.int_range(pl.len()).over(["customer_id", "transaction_ts"])))
+    work = work.with_columns(_key=key.cast(pl.Datetime("ns")))
+    out = work.with_columns(
+        pl.int_range(1, pl.len() + 1).over(
+            ["customer_id", pl.col("transaction_date").cast(pl.Date)]
+        ).cast(pl.Int64).alias("customer_day_txn_count"),
+        pl.col("amount_usd").cast(pl.Float64).rolling_sum_by(
+            "_key", window_size="7d", closed="right").over("customer_id")
+        .alias("customer_week_spend"),
+        (pl.col("transaction_date").cast(pl.Datetime("ns"))
+         - pl.col("transaction_date").cast(pl.Datetime("ns")).min().over("customer_id")
+         ).dt.total_days().cast(pl.Int64).alias("days_since_first_txn"),
+    ).sort("_row")
+    df = df.copy()
+    df["customer_day_txn_count"] = out["customer_day_txn_count"].to_numpy()
+    df["customer_week_spend"] = out["customer_week_spend"].to_numpy()
+    df["days_since_first_txn"] = out["days_since_first_txn"].to_numpy()
+    return df
 
 
 def _assign_fraud_type(df: pd.DataFrame, rng: np.random.Generator) -> pd.Series:
@@ -414,54 +440,83 @@ def build_fraud(df: pd.DataFrame) -> dict:
 # with ALL later card cash up to PAYMENT_HORIZON (facts._settled_closing_amounts,
 # facts._stmt_status), i.e. with payments dated after the observation date. They
 # must never feed a point-in-time feature. The status below is recomputed from
-# fact_payment_allocation rows dated on or before the observation date only.
+# card payments dated on or before the observation date only, replayed through
+# the simulator's own allocation/settlement functions.
 # statement.payments_amount / closing_balance / minimum_due / utilization_pct and
 # delinquency snapshots are as-of the statement cut (cash dated <= cycle end), so
 # they are safe.
-def check_payment_sources_asof(alloc_used: pd.DataFrame, obs: pd.Timestamp,
-                               date_col: str = "allocation_date") -> tuple[bool, str]:
+def check_payment_sources_asof(pay_used: pd.DataFrame, obs: pd.Timestamp,
+                               date_col: str = "payment_date") -> tuple[bool, str]:
     """Fail if any payment event feeding a feature is dated after ``obs``."""
-    if alloc_used.empty:
+    if pay_used.empty:
         return True, "no payment events used"
-    latest = pd.to_datetime(alloc_used[date_col]).max()
-    bad = int((pd.to_datetime(alloc_used[date_col]) > obs).sum())
-    return bad == 0, f"{bad} payment events after observation (latest {latest.date()})"
+    dates = pd.to_datetime(pay_used[date_col])
+    bad = int((dates > obs).sum())
+    return bad == 0, f"{bad} payment events after observation (latest {dates.max().date()})"
 
 
-def asof_payment_status(hist: pd.DataFrame, allocations: pd.DataFrame,
+def asof_payment_status(hist: pd.DataFrame, payments: pd.DataFrame,
                         obs: pd.Timestamp) -> tuple[pd.Series, pd.Series, pd.DataFrame]:
-    """Payment status of each statement using only payments dated <= ``obs``.
+    """Statement payment status as the simulator would have set it at ``obs``.
 
-    Returns (status indexed like ``hist``, latest payment date used per
-    statement, the allocation rows used). Mirrors ``facts._stmt_status`` with
-    allocation-so-far in place of the final settlement.
+    Replays the card payments dated <= ``obs`` through the SAME functions that
+    produce ``fact_statement.payment_status`` (``facts._waterfall`` for
+    allocation to minimums/balances, ``facts._settled_closing_amounts`` for the
+    cash that settles each closing balance, ``facts._stmt_status`` for the rule
+    order and thresholds), with ``obs`` in place of the period end. Payments
+    dated after ``obs`` are never read.
+
+    ``hist`` must be sorted by (account_id, statement_date). Returns (status
+    indexed like ``hist``, latest allocation date per statement, the payment
+    rows used).
+
+    Null handling (explicit): a null ``closing_balance`` gives a null status;
+    null ``billed_amount`` and ``minimum_due`` count as 0; a null
+    ``payment_due_date`` means the statement is already due (never PENDING).
+    Payments with a null account, date or amount are ignored; non-CARD payments
+    (instalment cash) are ignored; statements with no payments get no cash.
     """
-    a = allocations.copy()
-    a["allocation_date"] = pd.to_datetime(a.allocation_date)
-    used = a[a.allocation_date <= obs]
-    paid = used.groupby("statement_id").amount_usd.sum()
-    last_pay = used.groupby("statement_id").allocation_date.max()
-    allocated = hist.statement_id.map(paid).fillna(0.0).astype(float)
-    close = hist.closing_balance.astype(float)
-    billed = hist.billed_amount.astype(float)
-    due = pd.to_datetime(hist.payment_due_date)
-    min_due = hist.minimum_due.astype(float)
-    conds = [
-        close < -0.01,
-        billed <= 0.01,
-        close <= 0.0001,
-        allocated >= billed - 0.01,
-        (min_due > 0.01) & (allocated >= min_due - 0.01),
-        allocated > 0.01,
-        due > obs,
-    ]
-    status = np.select(
-        conds,
-        ["CREDIT_BALANCE", np.where(close <= 0.0001, "NO_BALANCE", "CARRY_FORWARD"),
-         "NO_BALANCE", "PAID_FULL", "PAID_PARTIAL", "PARTIAL", "PENDING"],
-        default="UNPAID")
-    return (pd.Series(status, index=hist.index),
-            hist.statement_id.map(last_pay), used)
+    from . import facts  # deferred: facts pulls in the whole simulator
+
+    pay = payments
+    if "payment_type" in pay.columns:
+        pay = pay[pay.payment_type == "CARD"]
+    pay = pay.dropna(subset=["account_id", "payment_date", "amount_usd"]).copy()
+    pay["payment_date"] = pd.to_datetime(pay.payment_date)
+    used = pay[pay.payment_date <= obs].sort_values("payment_date", kind="stable")
+    by_acct = {k: list(zip(g.payment_date.dt.date, g.amount_usd.astype(float)))
+               for k, g in used.groupby("account_id", sort=False)}
+    obs_d = obs.date()
+
+    status = pd.Series(None, index=hist.index, dtype=object)
+    last_pay = pd.Series(pd.NaT, index=hist.index, dtype="datetime64[ns]")
+    for _, g in hist.groupby("account_id", sort=False):
+        stmts = []
+        for r in g.itertuples():
+            billed = 0.0 if pd.isna(r.billed_amount) else float(r.billed_amount)
+            min_due = 0.0 if pd.isna(r.minimum_due) else float(r.minimum_due)
+            cut = pd.Timestamp(r.statement_date)
+            stmts.append(dict(
+                idx=r.Index, stmt_id=r.statement_id, statement_date=cut, cut=cut.date(),
+                closing_known=not pd.isna(r.closing_balance),
+                closing_balance=0.0 if pd.isna(r.closing_balance) else float(r.closing_balance),
+                billed=billed, min_eff=round(min(min_due, billed), 2),
+                alloc_min=0.0, alloc_bal=0.0, paid_by_due=False, last_pay_date=None,
+                due_date=(dt.date.min if pd.isna(r.payment_due_date)
+                          else pd.Timestamp(r.payment_due_date).date())))
+        pays = by_acct.get(g.account_id.iloc[0], [])
+        for pay_date, amount in pays:
+            eligible = [s for s in stmts if s["cut"] < pay_date]
+            if eligible:
+                facts._waterfall(eligible, amount, pay_date)
+        for s, settled in zip(stmts, facts._settled_closing_amounts(stmts, pays)):
+            s["settled"] = settled
+        for s in stmts:
+            status.at[s["idx"]] = (facts._stmt_status(s, obs_d)[0]
+                                   if s["closing_known"] else None)
+            if s["last_pay_date"] is not None:
+                last_pay.at[s["idx"]] = pd.Timestamp(s["last_pay_date"])
+    return status, last_pay, used
 
 
 # --------------------------------------------------------------------------
@@ -469,7 +524,7 @@ def asof_payment_status(hist: pd.DataFrame, allocations: pd.DataFrame,
 # --------------------------------------------------------------------------
 def build_credit_default(df: pd.DataFrame, accounts: pd.DataFrame,
                          customers: pd.DataFrame, statements: pd.DataFrame,
-                         delinq: pd.DataFrame, allocations: pd.DataFrame) -> None:
+                         delinq: pd.DataFrame, payments: pd.DataFrame) -> None:
     log("  ml: credit default")
     obs = pd.Timestamp(C.ML_OBSERVATION_DATE)
     end = pd.Timestamp(C.ML_OUTCOME_END)
@@ -481,9 +536,9 @@ def build_credit_default(df: pd.DataFrame, accounts: pd.DataFrame,
 
     # payment_status as known on the observation date (not the final status)
     hist = hist.copy()
-    hist["payment_status"], hist["_last_pay"], alloc_used = asof_payment_status(
-        hist, allocations, obs)
-    ok, detail = check_payment_sources_asof(alloc_used, obs)
+    hist["payment_status"], hist["_last_pay"], pay_used = asof_payment_status(
+        hist, payments, obs)
+    ok, detail = check_payment_sources_asof(pay_used, obs)
     if not ok:
         raise RuntimeError(f"credit_default leakage: {detail}")
 
@@ -660,26 +715,49 @@ def build_segmentation(df: pd.DataFrame) -> None:
 
 
 def build_forecast(df: pd.DataFrame) -> None:
+    """Merchant-month extract with train/test windows and no look-ahead.
+
+    Months before ``C.ML_FORECAST_TEST_START`` are ``split_time=train``; the rest
+    are ``test``. The merchant list (top ``ML_FORECAST_MERCHANTS`` by spend) and
+    ``seasonal_index`` use TRAIN-period spend only. ``seasonal_index`` is the
+    train-period total for the row's calendar month divided by the mean train
+    monthly total; it is null for a test month whose calendar month never occurs
+    in the train period (no seasonality evidence yet). Lags are one-month lags.
+    """
     log("  ml: forecast")
-    work = df.assign(month=df.transaction_date.dt.strftime("%Y-%m"))
-    monthly = work.groupby(["merchant_id", "month"]).agg(
-        txn_count=("transaction_id", "size"),
-        spend=("amount_usd", "sum"),
-        avg_ticket=("amount_usd", "mean"),
-    ).reset_index()
-    top = df.groupby("merchant_id").amount_usd.sum().nlargest(
-        C.ML_FORECAST_MERCHANTS).index
-    monthly = monthly[monthly.merchant_id.isin(set(top))].copy()
-    monthly = monthly.sort_values(["merchant_id", "month"])
-    monthly["prev_month_spend"] = monthly.groupby("merchant_id").spend.shift(1)
-    monthly["prev_month_txn"] = monthly.groupby("merchant_id").txn_count.shift(1)
-    monthly["month_of_year"] = pd.to_datetime(monthly.month + "-01").dt.month
-    monthly["quarter"] = pd.to_datetime(monthly.month + "-01").dt.quarter
-    monthly["is_q4"] = (monthly.quarter == 4).astype("int8")
-    totals = monthly.groupby("month").spend.sum()
-    seasonal = (totals / totals.mean()).round(6)
-    monthly["seasonal_index"] = monthly.month.map(seasonal)
-    write_parquet(monthly, ML / "forecast_merchant_month.parquet",
+    test_month = pd.Timestamp(C.ML_FORECAST_TEST_START).strftime("%Y-%m")
+    work = pl.from_pandas(df[["merchant_id", "transaction_id", "transaction_date", "amount_usd"]]
+                          .reset_index(drop=True))
+    work = work.with_columns(pl.col("transaction_date").cast(pl.Datetime("ns"))
+                             .dt.strftime("%Y-%m").alias("month"))
+    monthly = work.group_by(["merchant_id", "month"]).agg(
+        pl.len().cast(pl.Int64).alias("txn_count"),
+        pl.col("amount_usd").sum().alias("spend"),
+        pl.col("amount_usd").mean().alias("avg_ticket"),
+    )
+    train = monthly.filter(pl.col("month") < test_month)
+    top = (train.group_by("merchant_id").agg(pl.col("spend").sum())
+           .sort(["spend", "merchant_id"], descending=[True, False])
+           .head(C.ML_FORECAST_MERCHANTS)["merchant_id"])
+    monthly = (monthly.filter(pl.col("merchant_id").is_in(top.implode()))
+               .sort(["merchant_id", "month"]))
+    totals = train.group_by("month").agg(pl.col("spend").sum().alias("total"))
+    seasonal = (totals.with_columns(
+        pl.col("month").str.slice(5, 2).cast(pl.Int32).alias("month_of_year"),
+        (pl.col("total") / pl.col("total").mean()).round(6).alias("seasonal_index"))
+        .group_by("month_of_year").agg(pl.col("seasonal_index").mean()))
+    monthly = monthly.with_columns(
+        pl.col("spend").shift(1).over("merchant_id").alias("prev_month_spend"),
+        pl.col("txn_count").shift(1).over("merchant_id").cast(pl.Float64).alias("prev_month_txn"),
+        pl.col("month").str.slice(5, 2).cast(pl.Int32).alias("month_of_year"),
+    ).with_columns(
+        ((pl.col("month_of_year") - 1) // 3 + 1).cast(pl.Int32).alias("quarter"),
+    ).with_columns(
+        (pl.col("quarter") == 4).cast(pl.Int8).alias("is_q4"),
+        pl.when(pl.col("month") < test_month).then(pl.lit("train"))
+        .otherwise(pl.lit("test")).alias("split_time"),
+    ).join(seasonal, on="month_of_year", how="left")
+    write_parquet(monthly.to_pandas(), ML / "forecast_merchant_month.parquet",
                   "forecast_merchant_month")
 
 
@@ -708,6 +786,12 @@ is the ML-only label: 15% of true fraud is relabelled 0 (indistinguishable) and
 2% of non-fraud is relabelled 1 (false flag). Train and evaluate on
 `label_noisy`; use `label_true` only for diagnostics.
 
+**Velocity features.** `customer_day_txn_count` is the running count of the
+customer's transactions on the same date up to and including the current one;
+`customer_week_spend` is the customer's spend in the trailing 7 days
+`(ts - 7d, ts]` including the current transaction. Order is
+(`transaction_ts`, `transaction_id`); later transactions never change them.
+
 **Sequences.** A pair is labelled when a small approved purchase (<= $10 and
 <= 10% of the later amount) lands on the same customer within the prior 3 days
 of a confirmed fraud transaction. If the operational history has no match, an
@@ -728,7 +812,8 @@ observation date of 2026-03-31. Features use only statements, transactions and
 delinquency snapshots on or before that date; `max_source_date` records the
 latest fact date used (statement, delinquency snapshot and payment event) and
 must not exceed `observation_date`. `status_at_obs` and `paid_full_share_3m`
-are recomputed from payment allocations dated on or before the observation date;
+are recomputed by replaying card payments dated on or before the observation date
+through the simulator's own allocation/settlement rules;
 the final `fact_statement.payment_status` is settled with later cash and is not
 used. The label
 (`label_default`) is 1 when the account reaches 60+ DPD or is charged off in
@@ -753,8 +838,12 @@ has each customer's share of spend by merchant category.
 ## forecast_*
 
 `forecast_merchant_month.parquet` is merchant-month volume/spend for the 5,000
-largest merchants, with `month_of_year`, `quarter`, `is_q4`, a portfolio
-`seasonal_index`, and one-month lags. Rows before a merchant's second observed
+largest merchants, with `month_of_year`, `quarter`, `is_q4`, `seasonal_index`,
+one-month lags and `split_time`. Months before 2026-07 are `train`, the rest
+`test`. The merchant list and `seasonal_index` use train-period spend only
+(`seasonal_index` = train total for the row's calendar month / mean train monthly
+total; null for a test month whose calendar month is absent from the train
+period), so no test-window outcome leaks into the features. Rows before a merchant's second observed
 month have null lags by construction.
 
 ## Known limitations
@@ -785,14 +874,14 @@ def build_all() -> dict:
                         "fees_charged", "minimum_due", "credit_limit",
                         "utilization_pct", "payment_status", "billed_amount",
                         "payment_due_date"])
-    allocations = _read("fact/fact_payment_allocation.parquet",
-                        ["statement_id", "allocation_date", "amount_usd"])
+    payments = _read("fact/fact_payment.parquet",
+                     ["account_id", "payment_date", "amount_usd", "payment_type"])
     delinq = _read("fact/fact_delinquency_snapshot.parquet",
                    ["account_id", "snapshot_date", "days_past_due",
                     "delinquency_status"])
 
     report = build_fraud(purchases)
-    build_credit_default(purchases, accounts, customers, statements, delinq, allocations)
+    build_credit_default(purchases, accounts, customers, statements, delinq, payments)
     build_churn(purchases, customers, statements)
     build_segmentation(purchases)
     build_forecast(purchases)
