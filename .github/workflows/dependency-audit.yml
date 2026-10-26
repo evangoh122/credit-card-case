@@ -18,8 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           python-version: "3.12"
       - name: Export runtime dependencies
@@ -27,8 +27,14 @@ jobs:
       - name: Audit dependencies
         continue-on-error: ${{ github.event_name == 'schedule' }}
         run: |
-          uvx --python 3.12 pip-audit --requirement /tmp/requirements-audit.txt --format json --output /tmp/audit.json || true
-          python - <<'PY'
+          set +e
+          uvx --python 3.12 --from pip-audit==2.10.1 pip-audit --requirement /tmp/requirements-audit.txt --format json --output /tmp/audit.json
+          audit_status=$?
+          set -e
+          if [ "$audit_status" -gt 1 ]; then
+            exit "$audit_status"
+          fi
+          python3 - <<'PY'
           import json
           import sys
 
@@ -37,8 +43,8 @@ jobs:
           fixable = [
               (dependency["name"], vulnerability["id"], vulnerability["fix_versions"])
               for dependency in dependencies
-              for vulnerability in dependency["vulns"]
-              if vulnerability["fix_versions"]
+              for vulnerability in dependency.get("vulns", [])
+              if vulnerability.get("fix_versions")
           ]
           for package, vulnerability, fixes in fixable:
               print(f"{package}: {vulnerability} (fix: {', '.join(fixes)})")
