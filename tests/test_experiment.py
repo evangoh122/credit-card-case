@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import UTC, date, datetime
 
 import numpy as np
 import polars as pl
@@ -251,6 +251,89 @@ def test_overall_uplift_is_weighted_by_stratum_size_not_pooled_arm_mix() -> None
     assert overall["uplift"] != pytest.approx(0.52)
 
 
+def _tenure_frames():
+    assignment = pl.DataFrame(
+        {
+            "customer_id": ["a"],
+            "experiment_id": ["offer"],
+            "arm": ["test"],
+            "assigned_date": [date(2026, 1, 1)],
+            "stratum": ["Prime"],
+        }
+    )
+    dim = pl.DataFrame({"customer_id": ["a"], "tz": ["America/New_York"]})
+    events = pl.DataFrame(
+        {"customer_id": ["a"], "event_ts_utc": [datetime(2026, 1, 2, 15, tzinfo=UTC)]},
+        schema_overrides={"event_ts_utc": pl.Datetime("us", "UTC")},
+    )
+    return events, assignment, dim
+
+
+def test_tenure_rejects_assignment_without_dim_rows():
+    events, assignment, dim = _tenure_frames()
+    with pytest.raises(ValueError, match="assignment customer_ids missing from dim_customer"):
+        tenure_outcomes(
+            events,
+            assignment,
+            dim.filter(pl.col("customer_id") == "other"),
+            5,
+            as_of_date=date(2026, 1, 7),
+        )
+
+
+def test_tenure_rejects_events_without_dim_rows():
+    events, assignment, dim = _tenure_frames()
+    hidden = events.with_columns(pl.lit("ghost").alias("customer_id"))
+    with pytest.raises(ValueError, match="events customer_ids missing from dim_customer"):
+        tenure_outcomes(hidden, assignment, dim, 5, as_of_date=date(2026, 1, 7))
+
+
+def test_tenure_rejects_duplicate_dim_rows():
+    events, assignment, dim = _tenure_frames()
+    with pytest.raises(ValueError, match="customer_id must be unique"):
+        tenure_outcomes(events, assignment, pl.concat([dim, dim]), 5, as_of_date=date(2026, 1, 7))
+
+
+def test_tenure_rejects_null_time_zone():
+    events, assignment, dim = _tenure_frames()
+    dim = pl.DataFrame(
+        {"customer_id": ["a"], "tz": [None]},
+        schema_overrides={"tz": pl.String},
+    )
+    with pytest.raises(ValueError, match="must not contain nulls"):
+        tenure_outcomes(events, assignment, dim, 5, as_of_date=date(2026, 1, 7))
+
+
+def test_tenure_rejects_null_customer_ids():
+    events, assignment, dim = _tenure_frames()
+    null_events = events.with_columns(pl.lit(None, dtype=pl.String).alias("customer_id"))
+    with pytest.raises(ValueError, match="events customer_id must not contain nulls"):
+        tenure_outcomes(null_events, assignment, dim, 5, as_of_date=date(2026, 1, 7))
+
+    null_assignment = assignment.with_columns(pl.lit(None, dtype=pl.String).alias("customer_id"))
+    with pytest.raises(ValueError, match="assignment customer_id must not contain nulls"):
+        tenure_outcomes(events, null_assignment, dim, 5, as_of_date=date(2026, 1, 7))
+
+    null_dim = dim.with_columns(pl.lit(None, dtype=pl.String).alias("customer_id"))
+    with pytest.raises(ValueError, match="dim_customer customer_id must not contain nulls"):
+        tenure_outcomes(events, assignment, null_dim, 5, as_of_date=date(2026, 1, 7))
+
+
+def test_tenure_accepts_empty_events_and_assignment():
+    _, assignment, dim = _tenure_frames()
+    events = pl.DataFrame(
+        schema={
+            "customer_id": pl.String,
+            "event_ts_utc": pl.Datetime("us", "UTC"),
+        }
+    )
+    result = tenure_outcomes(events, assignment, dim, 5, as_of_date=date(2026, 1, 7))
+    assert result.row(0, named=True)["event_count"] == 0
+    assert result.row(0, named=True)["outcome"] == 0
+    empty = tenure_outcomes(events, assignment.clear(), dim, 5, as_of_date=date(2026, 1, 7))
+    assert empty.height == 0
+
+
 def test_tenure_outcomes_enforces_window_and_maturity_boundaries() -> None:
     assignment = pl.DataFrame(
         {
@@ -264,16 +347,23 @@ def test_tenure_outcomes_enforces_window_and_maturity_boundaries() -> None:
     events = pl.DataFrame(
         {
             "customer_id": ["mature", "mature", "mature", "boundary", "immature"],
-            "event_date": [
-                date(2025, 12, 31),
-                date(2026, 1, 1) + timedelta(days=4),
-                date(2026, 1, 1) + timedelta(days=5),
-                date(2026, 1, 3) + timedelta(days=4),
-                date(2026, 1, 4),
+            "event_ts_utc": [
+                datetime(2025, 12, 31, 15, tzinfo=UTC),
+                datetime(2026, 1, 5, 15, tzinfo=UTC),
+                datetime(2026, 1, 6, 15, tzinfo=UTC),
+                datetime(2026, 1, 7, 15, tzinfo=UTC),
+                datetime(2026, 1, 4, 15, tzinfo=UTC),
             ],
+        },
+        schema_overrides={"event_ts_utc": pl.Datetime("us", "UTC")},
+    )
+    dim = pl.DataFrame(
+        {
+            "customer_id": ["mature", "boundary", "immature"],
+            "tz": ["America/New_York"] * 3,
         }
     )
-    result = tenure_outcomes(events, assignment, 5, as_of_date=date(2026, 1, 7))
+    result = tenure_outcomes(events, assignment, dim, 5, as_of_date=date(2026, 1, 7))
 
     by_customer = {row["customer_id"]: row for row in result.iter_rows(named=True)}
     assert by_customer["mature"]["event_count"] == 1

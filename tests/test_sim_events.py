@@ -1,11 +1,13 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
+import numpy as np
 import polars as pl
 import pytest
 
+from ccc.geo import ZONES
 from ccc.sim import events, overlay, run
 from ccc.sim.scenario import Campaign, MacroShock, Scenario
-from ccc.timeutil import utc_to_et_date, window_bounds_utc
+from ccc.timeutil import local_date_expr, local_day_bounds_utc, sim_date, utc_to_local_date
 from tests.conftest import START
 
 SEED = 21
@@ -70,12 +72,22 @@ def test_output_schemas_and_labels(sim):
     assert t["dim_customer"].columns == [
         "customer_id",
         "name",
-        "join_date",
+        "city",
+        "tz",
+        "joined_ts_utc",
         "channel",
         "region",
         "loaded_at",
         "data_label",
     ]
+    assert t["dim_customer"]["joined_ts_utc"].dtype == pl.Datetime("us", "UTC")
+    assert not any(
+        name.endswith("_et") or name.endswith("_local") or name == "join_date"
+        for name in t["dim_customer"].columns
+    )
+    for dtype in t["dim_customer"].schema.values():
+        if dtype == pl.Datetime:
+            assert dtype.time_zone == "UTC"
     latent = {"risk", "spend_rate", "responsiveness", "utilisation"}
     assert not latent & set(t["dim_customer"].columns)
     assert "segment" not in t["dim_customer"].columns
@@ -90,43 +102,115 @@ def test_output_schemas_and_labels(sim):
     assert t["fact_transactions"]["transaction_id"].is_unique().all()
 
 
-def test_no_event_date_et_mismatch_and_all_inside_window(sim):
+def _local(event_frame: pl.DataFrame, dim: pl.DataFrame) -> pl.DataFrame:
+    return event_frame.join(dim.select("customer_id", "tz"), on="customer_id").with_columns(
+        local_date_expr("event_ts_utc", "tz").alias("local_date")
+    )
+
+
+def test_event_dates_are_utc_and_inside_each_local_day(sim):
     sc, t = sim
-    lo, hi = window_bounds_utc(sc.start_date, DAYS)
+    local_days = {sim_date(sc.start_date, i) for i in range(DAYS)}
     for name in ("fact_transactions", "fact_events"):
         df = t[name]
-        derived = [utc_to_et_date(ts) for ts in df["event_ts_utc"]]
-        assert derived == df["event_date_et"].to_list(), name
-        assert df["event_ts_utc"].min() >= lo and df["event_ts_utc"].max() < hi
         assert df["event_ts_utc"].dtype == pl.Datetime("us", "UTC")
+        assert df["event_date_utc"].dtype == pl.Date
+        assert [ts.date() for ts in df["event_ts_utc"]] == df["event_date_utc"].to_list(), name
+        derived = _local(df, t["dim_customer"])
+        assert set(derived["local_date"].to_list()) <= local_days, name
 
 
 def test_events_not_before_join(sim):
     _, t = sim
-    j = t["fact_events"].join(t["dim_customer"], on="customer_id")
-    assert (j["event_date_et"] >= j["join_date"]).all()
-
-
-def test_dst_fall_back_day_counts():
-    sc = Scenario("dst", date(2026, 10, 31), initial_customers=800, arrivals_per_day=0.0)
-    t = run.simulate(SEED, 3, sc)
-    fall = date(2026, 11, 1)
-    lo, hi = window_bounds_utc(fall, 1)
-    assert hi - lo == timedelta(hours=25)
-    ev = pl.concat(
-        [
-            t["fact_events"].select("event_ts_utc", "event_date_et"),
-            t["fact_transactions"].select("event_ts_utc", "event_date_et"),
-        ]
+    dim = t["dim_customer"].with_columns(
+        local_date_expr("joined_ts_utc", "tz").alias("join_local_date")
     )
-    day = ev.filter(pl.col("event_date_et") == fall)
-    in_span = ev.filter(pl.col("event_ts_utc").is_between(lo, hi, closed="left"))
-    assert day.height == in_span.height
-    hours = {int((ts - lo).total_seconds() // 3600) for ts in day["event_ts_utc"]}
-    assert hours == set(range(25))
-    per_day = ev.group_by("event_date_et").len().sort("event_date_et")
-    assert per_day["event_date_et"].to_list() == [date(2026, 10, 31), fall, date(2026, 11, 2)]
-    assert per_day["len"].min() > 0.7 * per_day["len"].max()
+    j = (
+        t["fact_events"]
+        .join(dim.select("customer_id", "tz", "join_local_date"), on="customer_id")
+        .with_columns(local_date_expr("event_ts_utc", "tz").alias("local_date"))
+    )
+    assert (j["local_date"] >= j["join_local_date"]).all()
+
+
+DST_ZONES = (
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+)
+DST_DAY_HOURS = {date(2026, 11, 1): 25, date(2026, 3, 8): 23}
+
+
+def _expected_day_hours(tz, day):
+    return DST_DAY_HOURS[day] if tz in DST_ZONES else 24
+
+
+class _DenseRng:
+    def __init__(self, count=96):
+        self.count = count
+
+    def poisson(self, lam):
+        return self.count
+
+    def random(self, size=None):
+        if size is None:
+            return 0.5
+        return (np.arange(size) + 0.5) / size
+
+    def lognormal(self, mean, sigma, size=None):
+        return 1.0 if size is None else np.ones(size)
+
+
+@pytest.mark.parametrize("tz", ZONES)
+@pytest.mark.parametrize(("day", "dst_hours"), [(date(2026, 11, 1), 25), (date(2026, 3, 8), 23)])
+def test_local_day_generation_covers_exact_utc_hour_buckets(tz, day, dst_hours):
+    expected = _expected_day_hours(tz, day)
+    lo, hi = local_day_bounds_utc(day, tz)
+    total_s = int((hi - lo).total_seconds())
+    assert total_s == expected * 3600
+    step = 60
+    stamps = [
+        events._stamp(lo, total_s, (i + 0.5) * step / total_s)[0] for i in range(total_s // step)
+    ]
+    assert len(set(stamps)) == len(stamps)
+    assert all(lo <= ts < hi for ts in stamps)
+    buckets = {int((ts - lo).total_seconds() // 3600) for ts in stamps}
+    assert buckets == set(range(expected))
+    assert {utc_to_local_date(ts, tz) for ts in stamps} == {day}
+
+
+@pytest.mark.parametrize("day", [date(2026, 11, 1), date(2026, 3, 8)])
+def test_simulate_events_covers_exact_utc_hour_buckets(monkeypatch, day):
+    monkeypatch.setattr(events, "entity_rng", lambda *args: _DenseRng())
+    monkeypatch.setattr(events, "_ppf", lambda q: q)
+    sc = Scenario("dst", day, initial_customers=1, arrivals_per_day=0.0, campaigns=())
+    customers = pl.DataFrame(
+        {
+            "customer_id": [f"c{i}" for i in range(len(ZONES))],
+            "join_day": [0] * len(ZONES),
+            "risk": [0.5] * len(ZONES),
+            "spend_rate": [1.0] * len(ZONES),
+            "utilisation": [0.5] * len(ZONES),
+            "tz": list(ZONES),
+        }
+    )
+    txns, evts = events.simulate_events(1, sc, customers, 1)
+    stamps = pl.concat(
+        [
+            txns.select("customer_id", "event_ts_utc"),
+            evts.select("customer_id", "event_ts_utc"),
+        ]
+    ).join(customers.select("customer_id", "tz"), on="customer_id")
+    for tz in ZONES:
+        expected = _expected_day_hours(tz, day)
+        local = stamps.filter(pl.col("tz") == tz)["event_ts_utc"].to_list()
+        lo, hi = local_day_bounds_utc(day, tz)
+        assert local
+        assert all(lo <= ts < hi for ts in local)
+        assert {utc_to_local_date(ts, tz) for ts in local} == {day}
+        buckets = {int((ts - lo).total_seconds() // 3600) for ts in local}
+        assert buckets == set(range(expected))
 
 
 def test_events_layer_alone_on_hand_built_customers():
@@ -138,16 +222,19 @@ def test_events_layer_alone_on_hand_built_customers():
             "risk": [0.9, 0.1],
             "spend_rate": [2.0, 0.5],
             "utilisation": [0.5, 0.5],
+            "tz": ["America/New_York", "America/Los_Angeles"],
         }
     )
     txns, evts = events.simulate_events(3, sc, cust, 4)
     assert txns.schema == pl.Schema(events.TXN_SCHEMA)
     assert evts.schema == pl.Schema(events.EVENT_SCHEMA)
-    b_first = min(
-        txns.filter(pl.col("customer_id") == "b")["event_date_et"].min(),
-        evts.filter(pl.col("customer_id") == "b")["event_date_et"].min(),
-    )
-    assert b_first >= date(2026, 11, 1)
+    b_stamps = [
+        ts
+        for frame in (txns, evts)
+        for ts in frame.filter(pl.col("customer_id") == "b")["event_ts_utc"]
+    ]
+    assert b_stamps
+    assert min(utc_to_local_date(ts, "America/Los_Angeles") for ts in b_stamps) >= date(2026, 11, 1)
     assert txns.filter(pl.col("customer_id") == "a").height > 0
 
 
@@ -161,17 +248,21 @@ def test_payday_spike_and_macro_shock_are_visible():
     )
     t = run.simulate(5, 16, sc)
     buys = (
-        t["fact_transactions"]
-        .filter(pl.col("txn_type") == "purchase")
-        .group_by("event_date_et")
+        _local(
+            t["fact_transactions"].filter(pl.col("txn_type") == "purchase"),
+            t["dim_customer"],
+        )
+        .group_by("local_date")
         .len()
     )
-    daily = dict(zip(buys["event_date_et"], buys["len"], strict=True))
+    daily = dict(zip(buys["local_date"], buys["len"], strict=True))
     payday, comparison = daily[date(2026, 11, 15)], daily[date(2026, 11, 8)]
     assert payday > comparison * 1.15
-    misses = t["fact_events"].filter(pl.col("event_type") == "missed_payment")
-    before = misses.filter(pl.col("event_date_et") < date(2026, 11, 10)).height / 8
-    after = misses.filter(pl.col("event_date_et") >= date(2026, 11, 11)).height / 5
+    misses = _local(
+        t["fact_events"].filter(pl.col("event_type") == "missed_payment"), t["dim_customer"]
+    )
+    before = misses.filter(pl.col("local_date") < date(2026, 11, 10)).height / 8
+    after = misses.filter(pl.col("local_date") >= date(2026, 11, 11)).height / 5
     assert after > before * 2
 
 

@@ -183,7 +183,8 @@ def hand_tables():
         },
         orient="row",
     )
-    return {"sim_truth_customer": truth, "fact_transactions": txns}
+    dim = pl.DataFrame({"customer_id": ids, "tz": ["America/New_York"] * len(ids)})
+    return {"sim_truth_customer": truth, "fact_transactions": txns, "dim_customer": dim}
 
 
 def test_estimate_lift_matches_hand_computed_delta_method_ci():
