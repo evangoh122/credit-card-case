@@ -60,10 +60,15 @@ def test_hand_computed_psi():
 
 
 def test_out_of_range_lands_in_end_bins():
-    df = pl.DataFrame({"x": [float(i) for i in range(1, 11)]})
-    ref = make_reference(df, ["x"], n_bins=2)
-    far = np.array([-1e9] * 5 + [1e9] * 5)
-    assert psi_numeric(ref, "x", far) == pytest.approx(0.0)
+    ref = make_reference(pl.DataFrame({"x": [1.0] * 3 + [10.0] * 7}), ["x"], n_bins=2)
+    assert ref.numeric_edges["x"] == [10.0]
+    assert ref.numeric_shares["x"] == [0.3, 0.7]
+    low_heavy = np.array([-1e9] * 8 + [1e9] * 2)
+    high_heavy = np.array([-1e9] * 2 + [1e9] * 8)
+    low_expected = 0.5 * math.log(0.8 / 0.3) - 0.5 * math.log(0.2 / 0.7)
+    high_expected = -0.1 * math.log(0.2 / 0.3) + 0.1 * math.log(0.8 / 0.7)
+    assert psi_numeric(ref, "x", low_heavy) == pytest.approx(low_expected)
+    assert psi_numeric(ref, "x", high_heavy) == pytest.approx(high_expected)
 
 
 def test_unseen_category_counts_as_drift(ref):
@@ -138,7 +143,70 @@ def test_single_noisy_period_not_alerted():
 
 def test_three_consecutive_alerts_fire():
     assert sustained_alert(["ok", "alert", "alert", "alert"])
-    assert not sustained_alert(["alert", "alert", "watch"])
+
+
+def test_three_watches_fire():
+    assert sustained_alert(["ok", "watch", "watch", "watch"])
+
+
+def test_mixed_watch_and_alert_fire():
+    assert sustained_alert(["watch", "alert", "watch"])
+
+
+def test_ok_interrupting_run_does_not_fire():
+    assert not sustained_alert(["alert", "alert", "ok", "alert", "alert"])
+    assert not sustained_alert(["watch", "ok", "watch", "watch"])
+
+
+def test_null_handling_identical_across_input_types():
+    ref = make_reference(pl.DataFrame({"c": ["a", "b", None]}), [], ["c"])
+    for current in (
+        pl.Series(["a", "b", None]),
+        np.array(["a", "b", None], dtype=object),
+        ["a", "b", None],
+        ["a", "b", float("nan")],
+    ):
+        assert psi_categorical(ref, "c", current) == pytest.approx(0.0)
+
+
+def test_numeric_nulls_and_nan_filtered():
+    df = pl.DataFrame({"x": [float(i) for i in range(1, 11)]})
+    ref = make_reference(df, ["x"], n_bins=2)
+    clean = np.array([1, 2, 3, 4, 5, 1, 2, 3, 9, 10], dtype=float)
+    dirty = np.concatenate([clean, [np.nan, np.nan]])
+    assert psi_numeric(ref, "x", dirty) == pytest.approx(psi_numeric(ref, "x", clean))
+    with_null = pl.Series(list(clean) + [None])
+    assert psi_numeric(ref, "x", with_null) == pytest.approx(psi_numeric(ref, "x", clean))
+
+
+def test_constant_numeric_column():
+    ref = make_reference(pl.DataFrame({"x": [3.0] * 20}), ["x"])
+    assert ref.numeric_edges["x"] == [3.0]
+    assert psi_numeric(ref, "x", np.array([3.0] * 5)) == pytest.approx(0.0)
+    assert math.isfinite(psi_numeric(ref, "x", np.array([9.0] * 5)))
+
+
+def test_tied_quantile_edges_and_empty_bins():
+    x = [0.0] * 90 + [1.0] * 10
+    ref = make_reference(pl.DataFrame({"x": x}), ["x"], n_bins=10)
+    edges = ref.numeric_edges["x"]
+    assert edges == sorted(set(edges))
+    assert sum(ref.numeric_shares["x"]) == pytest.approx(1.0)
+    psi = psi_numeric(ref, "x", np.array([5.0] * 10))
+    assert math.isfinite(psi) and psi > 0.25
+
+
+def test_all_null_distance_reference_rejected():
+    df = pl.DataFrame({"d": [None, None]}, schema={"d": pl.Float64})
+    with pytest.raises(ValueError, match="no non-null"):
+        make_reference(df, [], distance_col="d")
+
+
+def test_zero_distance_reference_ratio_not_infinite():
+    ref = make_reference(pl.DataFrame({"d": [0.0] * 10}), [], distance_col="d")
+    fit = cluster_fit(ref, np.array([0.0, 1.0]))
+    assert fit["mean_ratio"] is None
+    assert fit["far_share"] == pytest.approx(0.5)
 
 
 def test_reference_roundtrip(tmp_path, train, ref):

@@ -10,7 +10,7 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import adjusted_rand_score
 
 EPSILON = 1e-4
-OTHER = "__unseen__"
+FLOAT_TOL = 1e-9
 WATCH_PSI = 0.10
 ALERT_PSI = 0.25
 MIX_SHIFT_POINTS = 0.05
@@ -43,9 +43,8 @@ def _floats(values: Values) -> np.ndarray:
 
 
 def _labels(values: Values) -> list[str]:
-    if isinstance(values, pl.Series):
-        values = values.drop_nulls().to_list()
-    return [str(v) for v in values]
+    items = values.to_list() if isinstance(values, pl.Series) else list(values)
+    return [str(v) for v in items if v is not None and not (isinstance(v, float) and v != v)]
 
 
 def _shares(counts: Counter, keys: Sequence[str]) -> list[float]:
@@ -102,6 +101,8 @@ def make_reference(
     mean = threshold = None
     if distance_col is not None:
         d = _floats(df[distance_col])
+        if d.size == 0:
+            raise ValueError(f"column {distance_col!r} has no non-null values")
         mean = float(d.mean())
         threshold = float(np.quantile(d, FAR_QUANTILE))
 
@@ -149,7 +150,7 @@ def segment_mix_drift(ref: Reference, segments: Values) -> dict:
     keys = sorted(set(ref.segment_shares) | set(counts))
     shares = {k: counts[k] / total for k in keys}
     moves = {k: shares[k] - ref.segment_shares.get(k, 0.0) for k in keys}
-    flagged = [k for k in keys if abs(moves[k]) >= MIX_SHIFT_POINTS - 1e-9]
+    flagged = [k for k in keys if abs(moves[k]) >= MIX_SHIFT_POINTS - FLOAT_TOL]
     return {
         "shares": shares,
         "moves": moves,
@@ -166,7 +167,7 @@ def cluster_fit(ref: Reference, distances: Values) -> dict:
         raise ValueError("distances has no values")
     return {
         "mean_distance": float(d.mean()),
-        "mean_ratio": float(d.mean() / ref.distance_mean),
+        "mean_ratio": float(d.mean() / ref.distance_mean) if ref.distance_mean else None,
         "far_share": float(np.mean(d > ref.distance_far_threshold)),
     }
 
@@ -182,11 +183,11 @@ def structure_agreement(
 
 
 def sustained_alert(history: Sequence[str], min_periods: int = 3) -> bool:
-    """True only when the last min_periods statuses are all 'alert'."""
+    """True only when the last min_periods statuses are all 'watch' or 'alert'."""
     if min_periods < 1:
         raise ValueError("min_periods must be at least 1")
     recent = list(history)[-min_periods:]
-    return len(recent) == min_periods and all(s == "alert" for s in recent)
+    return len(recent) == min_periods and all(s in ("watch", "alert") for s in recent)
 
 
 def drift_report(
