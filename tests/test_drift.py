@@ -169,6 +169,17 @@ def test_null_handling_identical_across_input_types():
         assert psi_categorical(ref, "c", current) == pytest.approx(0.0)
 
 
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
+def test_numpy_float_nan_is_null_in_arrays_and_lists(dtype):
+    ref = make_reference(pl.DataFrame({"c": ["a", "b", None]}), [], ["c"])
+    nan = dtype(np.nan)
+    assert psi_categorical(ref, "c", ["a", "b", nan]) == pytest.approx(0.0)
+    assert psi_categorical(ref, "c", np.array(["a", "b", nan], dtype=object)) == pytest.approx(0.0)
+    float_ref = make_reference(pl.DataFrame({"c": [1.0, 2.0, None]}), [], ["c"])
+    arr = np.array([1.0, 2.0, np.nan], dtype=dtype)
+    assert psi_categorical(float_ref, "c", arr) == pytest.approx(0.0)
+
+
 def test_numeric_nulls_and_nan_filtered():
     df = pl.DataFrame({"x": [float(i) for i in range(1, 11)]})
     ref = make_reference(df, ["x"], n_bins=2)
