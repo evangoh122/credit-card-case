@@ -422,10 +422,34 @@ def test_tampered_model_json_rejected(tmp_path, field):
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="invalid segment model file"):
         SegmentModel.load(path)
+
+
+def test_tampered_version_only_rejected(tmp_path):
+    features, _ = blob_data()
+    model = fit_segmenter(features, 4)
+    path = tmp_path / "model.json"
+    model.save(path)
+    payload = json.loads(path.read_text())
     payload["version"] = "seg-1.0.0+deadbeef0000"
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="invalid segment model file"):
         SegmentModel.load(path)
+
+
+def test_choose_k_rejects_degenerate_candidates():
+    three = pl.DataFrame(
+        {
+            "arrears": [0.0, 1.0, 2.0] * 10,
+            "utilisation": [0.1, 0.2, 0.3] * 10,
+            "spend": [10.0, 20.0, 30.0] * 10,
+            "activity": [1.0, 2.0, 3.0] * 10,
+        }
+    )
+    with pytest.raises(ValueError, match=r"k=4 is not a valid clustering.*distinct"):
+        choose_k(three, [2, 3, 4])
+    identical = pl.DataFrame({name: [1.0] * 20 for name in FEATURE_COLUMNS})
+    with pytest.raises(ValueError, match=r"k=2 is not a valid clustering.*distinct"):
+        choose_k(identical, [2, 4])
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf"), "5", None, True])

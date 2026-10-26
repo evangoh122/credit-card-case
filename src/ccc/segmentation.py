@@ -178,6 +178,20 @@ class SegmentModel:
             raise ValueError(f"invalid segment model file: {path}") from exc
 
 
+def _fit_valid_kmeans(x: np.ndarray, z: np.ndarray, k: int, random_state: int) -> KMeans:
+    """Fit k-means and require a real k-cluster solution, else raise ValueError.
+
+    Needs at least k distinct rows, exactly k populated clusters and distinct centroids.
+    """
+    if len(np.unique(x, axis=0)) < k:
+        raise ValueError(f"need at least {k} distinct observations to fit {k} clusters")
+    km = KMeans(n_clusters=k, random_state=random_state, n_init=10).fit(z)
+    if len(np.unique(km.labels_)) != k:
+        raise ValueError(f"degenerate clustering: fewer than {k} populated clusters")
+    _check_centroids_distinct(np.asarray(km.cluster_centers_, dtype=float))
+    return km
+
+
 def fit_segmenter(
     features: pl.DataFrame,
     k: int,
@@ -188,16 +202,11 @@ def fit_segmenter(
     x = _matrix(features, names)
     if isinstance(k, bool) or not isinstance(k, int) or not 2 <= k <= x.shape[0]:
         raise ValueError(f"k must be an integer in [2, {x.shape[0]}], got {k!r}")
-    if len(np.unique(x, axis=0)) < k:
-        raise ValueError(f"need at least {k} distinct observations to fit {k} clusters")
     # A zero-variance column is allowed: StandardScaler gives it scale 1.0, so it adds the
     # same distance to every centroid and cannot affect assignment.
     scaler = StandardScaler()
     z = scaler.fit_transform(x)
-    km = KMeans(n_clusters=k, random_state=random_state, n_init=10).fit(z)
-    if len(np.unique(km.labels_)) != k:
-        raise ValueError(f"degenerate clustering: fewer than {k} populated clusters")
-    _check_centroids_distinct(np.asarray(km.cluster_centers_, dtype=float))
+    km = _fit_valid_kmeans(x, z, k, random_state)
     mean = tuple(float(v) for v in scaler.mean_)
     scale = tuple(float(v) for v in scaler.scale_)
     centroids = tuple(tuple(float(v) for v in row) for row in km.cluster_centers_)
@@ -230,6 +239,10 @@ def choose_k(
 
     k_range must include 4. Tiering always uses k=4 (see fit_tiered); if the best k is not 4
     the table shows how much silhouette the four-tier structure gives up.
+
+    Every candidate must be a real k-cluster solution (see fit_segmenter). A degenerate
+    candidate raises ValueError naming the k instead of being skipped, so a score is never
+    reported under a k the data cannot support.
     """
     names = _feature_names(include_rfm)
     x = _matrix(features, names)
@@ -244,7 +257,10 @@ def choose_k(
     for k in ks:
         if isinstance(k, bool) or not isinstance(k, int) or not 2 <= k <= n - 1:
             raise ValueError(f"k must be an integer in [2, {n - 1}], got {k!r}")
-        labels = KMeans(n_clusters=k, random_state=random_state, n_init=10).fit_predict(z)
+        try:
+            labels = _fit_valid_kmeans(x, z, k, random_state).labels_
+        except ValueError as exc:
+            raise ValueError(f"k={k} is not a valid clustering: {exc}") from exc
         scores.append(float(silhouette_score(z, labels)))
     table = pl.DataFrame({"k": ks, "silhouette": scores})
     best = ks[max(range(len(ks)), key=lambda i: (scores[i], -ks[i]))]
