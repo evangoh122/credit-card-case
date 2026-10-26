@@ -30,9 +30,11 @@ def test_dst_day_lengths():
 
 
 def test_fall_back_boundary_maps_to_correct_et_date():
-    # 04:30Z is 00:30 EDT on Nov 1; 05:30Z is 01:30 EST (repeated hour) on Nov 1.
-    assert utc_to_et_date(utc(2026, 11, 1, 4, 30)) == date(2026, 11, 1)
-    assert utc_to_et_date(utc(2026, 11, 1, 5, 30)) == date(2026, 11, 1)
+    # 04:30Z is 00:30 EDT, 05:30Z is 01:30 EDT, 06:30Z is the repeated 01:30, now EST.
+    for hour, minute in [(4, 30), (5, 30), (6, 30)]:
+        assert utc_to_et_date(utc(2026, 11, 1, hour, minute)) == date(2026, 11, 1)
+    assert utc(2026, 11, 1, 5, 30).astimezone(ET).utcoffset() == timedelta(hours=-4)
+    assert utc(2026, 11, 1, 6, 30).astimezone(ET).utcoffset() == timedelta(hours=-5)
     # 03:59Z is still Oct 31 evening ET; 04:00Z is the first instant of Nov 1.
     assert utc_to_et_date(utc(2026, 11, 1, 3, 59)) == date(2026, 10, 31)
     assert utc_to_et_date(utc(2026, 11, 1, 4, 0)) == date(2026, 11, 1)
@@ -96,3 +98,11 @@ def test_business_days():
     assert add_business_days(fri, 5) == date(2026, 11, 6)
     assert add_business_days(date(2026, 11, 2), -1) == fri
     assert add_business_days(fri, 0) == fri
+
+
+def test_window_requires_positive_days():
+    for days in (0, -1):
+        with pytest.raises(ValueError):
+            window_dates(date(2026, 1, 1), days)
+        with pytest.raises(ValueError):
+            window_bounds_utc(date(2026, 1, 1), days)
