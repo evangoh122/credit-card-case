@@ -180,34 +180,37 @@ def test_local_day_generation_covers_exact_utc_hour_buckets(tz, day, dst_hours):
     assert {utc_to_local_date(ts, tz) for ts in stamps} == {day}
 
 
-@pytest.mark.parametrize("tz", ZONES)
 @pytest.mark.parametrize("day", [date(2026, 11, 1), date(2026, 3, 8)])
-def test_simulate_events_covers_exact_utc_hour_buckets(monkeypatch, tz, day):
-    expected = _expected_day_hours(tz, day)
+def test_simulate_events_covers_exact_utc_hour_buckets(monkeypatch, day):
     monkeypatch.setattr(events, "entity_rng", lambda *args: _DenseRng())
     monkeypatch.setattr(events, "_ppf", lambda q: q)
     sc = Scenario("dst", day, initial_customers=1, arrivals_per_day=0.0, campaigns=())
     customers = pl.DataFrame(
         {
-            "customer_id": ["c"],
-            "join_day": [0],
-            "risk": [0.5],
-            "spend_rate": [1.0],
-            "utilisation": [0.5],
-            "tz": [tz],
+            "customer_id": [f"c{i}" for i in range(len(ZONES))],
+            "join_day": [0] * len(ZONES),
+            "risk": [0.5] * len(ZONES),
+            "spend_rate": [1.0] * len(ZONES),
+            "utilisation": [0.5] * len(ZONES),
+            "tz": list(ZONES),
         }
     )
     txns, evts = events.simulate_events(1, sc, customers, 1)
-    stamps = [
-        *txns.get_column("event_ts_utc").to_list(),
-        *evts.get_column("event_ts_utc").to_list(),
-    ]
-    lo, hi = local_day_bounds_utc(day, tz)
-    assert stamps
-    assert all(lo <= ts < hi for ts in stamps)
-    assert {utc_to_local_date(ts, tz) for ts in stamps} == {day}
-    buckets = {int((ts - lo).total_seconds() // 3600) for ts in stamps}
-    assert buckets == set(range(expected))
+    stamps = pl.concat(
+        [
+            txns.select("customer_id", "event_ts_utc"),
+            evts.select("customer_id", "event_ts_utc"),
+        ]
+    ).join(customers.select("customer_id", "tz"), on="customer_id")
+    for tz in ZONES:
+        expected = _expected_day_hours(tz, day)
+        local = stamps.filter(pl.col("tz") == tz)["event_ts_utc"].to_list()
+        lo, hi = local_day_bounds_utc(day, tz)
+        assert local
+        assert all(lo <= ts < hi for ts in local)
+        assert {utc_to_local_date(ts, tz) for ts in local} == {day}
+        buckets = {int((ts - lo).total_seconds() // 3600) for ts in local}
+        assert buckets == set(range(expected))
 
 
 def test_events_layer_alone_on_hand_built_customers():
