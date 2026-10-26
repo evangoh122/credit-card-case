@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 import polars as pl
 import pytest
@@ -132,49 +132,30 @@ def test_events_not_before_join(sim):
     assert (j["local_date"] >= j["join_local_date"]).all()
 
 
-def test_dst_fall_back_day_counts():
-    sc = Scenario("dst", date(2026, 10, 31), initial_customers=800, arrivals_per_day=0.0)
-    t = run.simulate(SEED, 3, sc)
-    fall = date(2026, 11, 1)
-    ev = pl.concat(
-        [
-            t["fact_events"].select("customer_id", "event_ts_utc"),
-            t["fact_transactions"].select("customer_id", "event_ts_utc"),
-        ]
-    )
-    local = _local(ev, t["dim_customer"])
-    assert set(local["local_date"].to_list()) == {
-        date(2026, 10, 31),
-        fall,
-        date(2026, 11, 2),
-    }
-    for tz in ZONES:
-        zone = local.filter(pl.col("tz") == tz)
-        lo, hi = local_day_bounds_utc(fall, tz)
-        day = zone.filter(pl.col("local_date") == fall)
-        in_span = zone.filter(pl.col("event_ts_utc").is_between(lo, hi, closed="left"))
-        assert day.height == in_span.height, tz
-        hours = {int((ts - lo).total_seconds() // 3600) for ts in day["event_ts_utc"]}
-        assert hours <= set(range(round((hi - lo).total_seconds() / 3600))), tz
-    dst_hours = set()
-    for tz in ("America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles"):
-        lo, _ = local_day_bounds_utc(fall, tz)
-        dst_hours |= {
-            int((ts - lo).total_seconds() // 3600)
-            for ts in local.filter((pl.col("tz") == tz) & (pl.col("local_date") == fall))[
-                "event_ts_utc"
-            ]
-        }
-    assert dst_hours == set(range(25))
-    phx = local.filter(pl.col("tz") == "America/Phoenix")
-    lo, hi = local_day_bounds_utc(fall, "America/Phoenix")
-    assert hi - lo == timedelta(hours=24)
-    phx_hours = {
-        int((ts - lo).total_seconds() // 3600)
-        for ts in phx.filter(pl.col("local_date") == fall)["event_ts_utc"]
-    }
-    assert phx_hours
-    assert phx_hours <= set(range(24))
+DST_ZONES = (
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+)
+
+
+@pytest.mark.parametrize("tz", ZONES)
+@pytest.mark.parametrize(("day", "dst_hours"), [(date(2026, 11, 1), 25), (date(2026, 3, 8), 23)])
+def test_local_day_generation_covers_exact_utc_hour_buckets(tz, day, dst_hours):
+    expected = dst_hours if tz in DST_ZONES else 24
+    lo, hi = local_day_bounds_utc(day, tz)
+    total_s = int((hi - lo).total_seconds())
+    assert total_s == expected * 3600
+    step = 60
+    stamps = [
+        events._stamp(lo, total_s, (i + 0.5) * step / total_s)[0] for i in range(total_s // step)
+    ]
+    assert len(set(stamps)) == len(stamps)
+    assert all(lo <= ts < hi for ts in stamps)
+    buckets = {int((ts - lo).total_seconds() // 3600) for ts in stamps}
+    assert buckets == set(range(expected))
+    assert {utc_to_local_date(ts, tz) for ts in stamps} == {day}
 
 
 def test_events_layer_alone_on_hand_built_customers():

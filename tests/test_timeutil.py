@@ -14,8 +14,10 @@ from ccc.timeutil import (
     sim_date,
     snapshot_cutoff_utc,
     utc_to_local_date,
+    validate_zones,
     window_bounds_utc,
     window_dates,
+    zone,
 )
 
 
@@ -99,6 +101,18 @@ def test_wall_clock_campaign_time_is_zone_aware():
     assert local_to_utc(datetime(2026, 11, 2, 9), "America/New_York") == utc(2026, 11, 2, 14)
     assert local_to_utc(datetime(2026, 11, 2, 9), "America/Phoenix") == utc(2026, 11, 2, 16)
     assert local_to_utc(datetime(2026, 11, 2, 9), "Pacific/Honolulu") == utc(2026, 11, 2, 19)
+
+
+def test_zone_and_zone_series_require_valid_iana_names():
+    for value in (None, 3):
+        with pytest.raises(ValueError, match="unknown IANA time zone"):
+            zone(value)
+    with pytest.raises(ValueError, match="unknown IANA time zone"):
+        zone("Mars/Olympus")
+    with pytest.raises(ValueError, match="must not contain nulls"):
+        validate_zones(pl.Series("tz", ["America/New_York", None]))
+    with pytest.raises(ValueError, match="unknown IANA time zone"):
+        validate_zones(pl.Series("tz", ["America/New_York", "Mars/Olympus"]))
 
 
 def test_naive_timestamp_rejected():

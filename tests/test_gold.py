@@ -217,6 +217,48 @@ def test_engagement_is_separate_from_rfm():
     assert not set(("recency", "frequency", "monetary")).intersection(result.columns)
 
 
+def test_engagement_rejects_facts_without_dim_rows():
+    events = pl.DataFrame(
+        {
+            "customer_id": ["a", "ghost"],
+            "event_type": ["app_open", "app_open"],
+            "event_ts_utc": [datetime(2026, 10, 1, 15, tzinfo=UTC)] * 2,
+        }
+    )
+    dim = pl.DataFrame({"customer_id": ["a"], "tz": ["America/New_York"]})
+    with pytest.raises(ValueError, match="missing from dim_customer"):
+        engagement_features(events, dim, date(2026, 10, 3))
+
+
+def test_engagement_rejects_duplicate_dim_rows():
+    events = pl.DataFrame(
+        {
+            "customer_id": ["a"],
+            "event_type": ["app_open"],
+            "event_ts_utc": [datetime(2026, 10, 1, 15, tzinfo=UTC)],
+        }
+    )
+    dim = pl.DataFrame({"customer_id": ["a", "a"], "tz": ["America/New_York"] * 2})
+    with pytest.raises(ValueError, match="customer_id must be unique"):
+        engagement_features(events, dim, date(2026, 10, 3))
+
+
+def test_engagement_rejects_null_time_zone():
+    events = pl.DataFrame(
+        {
+            "customer_id": ["a"],
+            "event_type": ["app_open"],
+            "event_ts_utc": [datetime(2026, 10, 1, 15, tzinfo=UTC)],
+        }
+    )
+    dim = pl.DataFrame(
+        {"customer_id": ["a"], "tz": [None]},
+        schema_overrides={"tz": pl.String},
+    )
+    with pytest.raises(ValueError, match="must not contain nulls"):
+        engagement_features(events, dim, date(2026, 10, 3))
+
+
 def _segment_features() -> pl.DataFrame:
     return pl.DataFrame(
         {

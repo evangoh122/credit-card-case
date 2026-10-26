@@ -17,7 +17,7 @@ from ccc.segmentation import (
     hard_credit_rules,
     map_clusters_to_tiers,
 )
-from ccc.timeutil import local_date_expr, snapshot_cutoff_utc
+from ccc.timeutil import local_date_expr, snapshot_cutoff_utc, validate_zones
 
 LOGGER = logging.getLogger(__name__)
 RFM_METRICS = ("recency", "frequency", "monetary")
@@ -37,7 +37,13 @@ def guard_no_truth_columns(frame: pl.DataFrame) -> None:
         )
 
 
+def _require_columns(frame: pl.DataFrame, required: set[str], name: str) -> None:
+    if missing := required.difference(frame.columns):
+        raise ValueError(f"{name} missing columns: {sorted(missing)}")
+
+
 def _zone_cutoffs(snapshot_date: date, zones: pl.Series) -> pl.DataFrame:
+    validate_zones(zones)
     names = sorted(zones.unique().to_list())
     return pl.DataFrame(
         {
@@ -49,6 +55,18 @@ def _zone_cutoffs(snapshot_date: date, zones: pl.Series) -> pl.DataFrame:
 
 
 def _local_dates(frame: pl.DataFrame, dim_customer: pl.DataFrame) -> pl.DataFrame:
+    _require_columns(frame, {"customer_id", "event_ts_utc"}, "fact")
+    _require_columns(dim_customer, {"customer_id", "tz"}, "dim_customer")
+    dim_ids = dim_customer.get_column("customer_id")
+    if dim_ids.n_unique() != dim_customer.height:
+        raise ValueError("dim_customer customer_id must be unique")
+    validate_zones(dim_customer.get_column("tz"))
+    fact_ids = frame.get_column("customer_id").unique()
+    unknown = fact_ids.filter(~fact_ids.is_in(dim_ids.implode()))
+    if len(unknown):
+        raise ValueError(
+            f"fact customer_ids missing from dim_customer: {sorted(unknown.to_list(), key=str)[:5]}"
+        )
     return frame.join(
         dim_customer.select("customer_id", "tz"), on="customer_id", how="inner"
     ).with_columns(local_date_expr("event_ts_utc", "tz").alias("event_local_date"))
