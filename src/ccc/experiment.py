@@ -8,6 +8,7 @@ from scipy.optimize import brentq
 from scipy.stats import norm
 
 from ccc.rng import unit_hash
+from ccc.timeutil import local_date_expr
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_ARMS = {"control": 0.5, "test": 0.5}
@@ -382,28 +383,34 @@ def _uplift_row(estimate: Mapping[str, float | int | str], z: float) -> tuple:
 def tenure_outcomes(
     events: pl.DataFrame,
     assignment: pl.DataFrame,
+    dim_customer: pl.DataFrame,
     window_days: int,
     *,
     as_of_date: date,
-    event_date_col: str = "event_date",
 ) -> pl.DataFrame:
-    """Reduce events to equal-tenure customer outcomes and flag incomplete windows."""
+    """Reduce events to equal-tenure customer outcomes and flag incomplete windows.
+
+    Event dates are each customer's local business date derived from the UTC instant
+    and the zone held in dim_customer.
+    """
     if window_days < 1:
         raise ValueError("window_days must be positive")
-    if event_date_col not in events.columns:
-        raise ValueError(f"missing event date column {event_date_col!r}")
+    required = {"customer_id", "event_ts_utc"}
+    if missing := required.difference(events.columns):
+        raise ValueError(f"events missing columns: {sorted(missing)}")
     base = assignment.with_columns(
         (pl.lit(as_of_date) < pl.col("assigned_date") + pl.duration(days=window_days - 1)).alias(
             "immature"
         )
     )
+    local = events.join(
+        dim_customer.select("customer_id", "tz"), on="customer_id", how="inner"
+    ).with_columns(local_date_expr("event_ts_utc", "tz").alias("event_local_date"))
     in_window = (
-        events.join(
-            assignment.select("customer_id", "assigned_date"), on="customer_id", how="inner"
-        )
+        local.join(assignment.select("customer_id", "assigned_date"), on="customer_id", how="inner")
         .filter(
-            (pl.col(event_date_col) >= pl.col("assigned_date"))
-            & (pl.col(event_date_col) < pl.col("assigned_date") + pl.duration(days=window_days))
+            (pl.col("event_local_date") >= pl.col("assigned_date"))
+            & (pl.col("event_local_date") < pl.col("assigned_date") + pl.duration(days=window_days))
         )
         .group_by("customer_id")
         .agg(pl.len().alias("event_count"))

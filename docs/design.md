@@ -53,7 +53,7 @@ One seeded script simulates 60 days; no scheduler needed.
 - Scenario config declares campaigns (e.g. day 5), payday spike, macro shock on arrears, fee change.
 - True effect sizes planted in advance, including null campaigns.
 - ~20 seeds; trust only results that hold across them.
-- DST ends Sunday 2026-11-01 (25-hour day); daily counts and RFM windows must handle it.
+- Each customer has a city and IANA zone; weekday, payday and 09:00 campaign effects follow the customer's local calendar. DST days are 23 or 25 hours per zone (25h on 2026-11-01, 23h on 2026-03-08; Phoenix and Honolulu stay at 24h).
 - Seed table: hand-written latent-profile generator; get approval before training on any real bank data.
 
 ### Layers
@@ -78,23 +78,25 @@ One parent run per simulation, child run per cohort/seed.
 ## Gold tables
 | Table | Grain | Contents |
 |---|---|---|
-| dim_customer | customer | Surrogate ID, join date, channel, region. No segment, no latent profile |
+| dim_customer | customer | Surrogate ID, city, IANA zone, join UTC timestamp, channel, region. No local-time columns, no segment, no latent profile |
 | sim_truth_customer | customer | Latent profile and true effects; generator/validation only, never used by models |
-| fact_transactions, fact_events | event | Purchases, repayments, app activity; partitioned by business date |
+| fact_transactions, fact_events | event | Purchases, repayments, app activity; UTC timestamps and UTC event dates for partitioning |
 | fact_rfm_snapshot | customer x snapshot date | R/F/M over fixed windows, scores from saved bin edges |
 | fact_segment_assignment | customer x snapshot date | Segment, model version |
 | fact_experiment_assignment | customer x experiment | Arm, assigned date, stratum |
 
-- RFM comes from `fact_transactions` with event_date_et <= snapshot_date, left-joined from the dimension (no transactions: frequency/monetary 0, recency null or days since join).
+- RFM comes from `fact_transactions` using each customer's local event date (derived from `event_ts_utc` and `tz`) <= snapshot_date, left-joined from the dimension (no transactions: frequency/monetary 0, recency null or days since join).
 - Non-purchase events feed separate engagement features.
 - Snapshots, not overwrites.
 
 ## Data contract
 Time
-- Store `event_ts_utc`; derive `event_date_et` once (America/New_York, zone name never fixed offset).
-- DST days are 23 or 25 hours: use calendar days, never 24h arithmetic. Convert UTC to local, never the reverse.
-- Snapshot cutoff 23:59:59 ET; filter event_date_et <= snapshot_date. Snapshots frozen once written; late events land in the next snapshot and their count is logged.
-- Campaigns are zoned timestamps. Simulation uses a fixed calendar, never now().
+- UTC is the storage format. Every timestamp (`event_ts_utc`, `joined_ts_utc`, `loaded_at`) is timezone-aware UTC and every stored date (`event_date_utc`, snapshot and assignment dates) is a UTC date.
+- `dim_customer` carries stable `city` and `tz` (IANA zone name, never a fixed offset); it stores no local-time columns. Local business dates are derived at feature/query time from the UTC instant plus the customer's zone.
+- DST days are 23 or 25 hours: use calendar days per zone, never 24h arithmetic. US DST began 2026-03-08 and ends 2026-11-01; Phoenix and Honolulu are always 24h.
+- Snapshot cutoff is 23:59:59 local per customer zone, converted to a UTC instant; point-in-time rule is local event date <= snapshot date. Snapshots are frozen once written; late events land in the next snapshot and their count is logged.
+- Local wall times convert to UTC only when explicitly given (campaign 09:00 local). Ambiguous fall-back times use the first occurrence; nonexistent spring-forward times shift forward by the gap.
+- Campaigns are local wall-time windows interpreted per customer zone. Simulation uses a fixed calendar, never now().
 
 Randomness
 - One root seed per run; per-entity generators from hash(root seed, customer ID, day), so adding customers does not reshuffle others.
@@ -113,5 +115,5 @@ Loading and experiments
 - [ ] Extend drift to categorical features and distance-to-centroid
 - [ ] Simulator: latent profiles, arrivals, scenario config
 - [ ] Decide: RFM as k-means features or descriptive only
-- [ ] Confirm America/New_York with data owners
+- [x] Resolved: per-city IANA zones with UTC storage
 - [ ] Load gold tables, run ~20 seeds

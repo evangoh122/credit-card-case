@@ -18,7 +18,7 @@ from ccc.gold import (
 from ccc.segmentation import fit_tiered
 from ccc.sim.run import simulate
 from ccc.sim.scenario import Scenario
-from ccc.timeutil import et_day_hours, snapshot_cutoff_utc, utc_to_et_date
+from ccc.timeutil import local_date_expr, local_day_hours, snapshot_cutoff_utc
 
 WINDOWS = {"recency": 30, "frequency": 30, "monetary": 30}
 
@@ -27,8 +27,15 @@ def _customers() -> pl.DataFrame:
     return pl.DataFrame(
         {
             "customer_id": ["a", "b", "future"],
-            "join_date": [date(2026, 10, 1), date(2026, 10, 25), date(2026, 11, 2)],
-        }
+            "city": ["New York", "Los Angeles", "New York"],
+            "tz": ["America/New_York", "America/Los_Angeles", "America/New_York"],
+            "joined_ts_utc": [
+                datetime(2026, 10, 1, 12, tzinfo=UTC),
+                datetime(2026, 10, 25, 12, tzinfo=UTC),
+                datetime(2026, 11, 2, 12, tzinfo=UTC),
+            ],
+        },
+        schema_overrides={"joined_ts_utc": pl.Datetime("us", "UTC")},
     )
 
 
@@ -43,12 +50,6 @@ def _transactions() -> pl.DataFrame:
                 datetime(2026, 11, 2, 4, 30, tzinfo=UTC),
                 datetime(2026, 11, 2, 5, 0, tzinfo=UTC),
                 datetime(2026, 10, 30, 12, tzinfo=UTC),
-            ],
-            "event_date_et": [
-                date(2026, 10, 20),
-                date(2026, 11, 1),
-                date(2026, 11, 2),
-                date(2026, 10, 30),
             ],
         }
     )
@@ -67,7 +68,7 @@ def test_rfm_is_point_in_time_and_left_joined():
 
 
 def test_rfm_windows_use_calendar_dates_across_dst_fallback():
-    assert et_day_hours(date(2026, 11, 1)) == 25
+    assert local_day_hours(date(2026, 11, 1), "America/New_York") == 25
     transactions = pl.DataFrame(
         {
             "customer_id": ["a", "a", "a"],
@@ -79,15 +80,53 @@ def test_rfm_windows_use_calendar_dates_across_dst_fallback():
                 datetime(2026, 11, 2, 4, 30, tzinfo=UTC),
             ],
         }
-    ).with_columns(
-        pl.col("event_ts_utc")
-        .map_elements(utc_to_et_date, return_dtype=pl.Date)
-        .alias("event_date_et")
     )
     windows = {"recency": 2, "frequency": 2, "monetary": 2}
     result = rfm_snapshot(_customers(), transactions, date(2026, 11, 1), windows)
     row = result.filter(pl.col("customer_id") == "a").row(0, named=True)
     assert (row["recency"], row["frequency"], row["monetary"]) == (0, 2, 60.0)
+
+
+def test_rfm_uses_each_customers_local_cutoff():
+    dim = pl.DataFrame(
+        {
+            "customer_id": ["east", "west"],
+            "tz": ["America/New_York", "America/Los_Angeles"],
+            "joined_ts_utc": [datetime(2026, 10, 1, 12, tzinfo=UTC)] * 2,
+        },
+        schema_overrides={"joined_ts_utc": pl.Datetime("us", "UTC")},
+    )
+    transactions = pl.DataFrame(
+        {
+            "customer_id": ["east", "west"],
+            "txn_type": ["purchase", "purchase"],
+            "amount": [10.0, 20.0],
+            "event_ts_utc": [datetime(2026, 11, 2, 5, 30, tzinfo=UTC)] * 2,
+        }
+    )
+    result = rfm_snapshot(dim, transactions, date(2026, 11, 1), WINDOWS)
+    east = result.filter(pl.col("customer_id") == "east").row(0, named=True)
+    west = result.filter(pl.col("customer_id") == "west").row(0, named=True)
+    assert (east["frequency"], east["recency"]) == (0, None)
+    assert (west["frequency"], west["recency"]) == (1, 0)
+
+
+def test_late_event_is_judged_against_each_customers_cutoff():
+    dim = pl.DataFrame(
+        {"customer_id": ["east", "west"], "tz": ["America/New_York", "America/Los_Angeles"]}
+    )
+    events = pl.DataFrame(
+        {
+            "customer_id": ["east", "west"],
+            "event_ts_utc": [datetime(2026, 11, 1, 15, tzinfo=UTC)] * 2,
+            "loaded_at": [datetime(2026, 11, 2, 5, 30, tzinfo=UTC)] * 2,
+        },
+        schema_overrides={
+            "event_ts_utc": pl.Datetime("us", "UTC"),
+            "loaded_at": pl.Datetime("us", "UTC"),
+        },
+    )
+    assert count_late_events(events, dim, date(2026, 11, 1), date(2026, 11, 2)) == 1
 
 
 def test_saved_bins_are_reused_without_refitting(tmp_path):
@@ -162,16 +201,17 @@ def test_engagement_is_separate_from_rfm():
         {
             "customer_id": ["b", "a", "a", "a", "a"],
             "event_type": ["app_open", "app_open", "repayment", "missed_payment", "app_open"],
-            "event_date_et": [
-                date(2026, 10, 1),
-                date(2026, 10, 1),
-                date(2026, 10, 2),
-                date(2026, 10, 2),
-                date(2026, 10, 4),
+            "event_ts_utc": [
+                datetime(2026, 10, 1, 15, tzinfo=UTC),
+                datetime(2026, 10, 1, 15, tzinfo=UTC),
+                datetime(2026, 10, 2, 15, tzinfo=UTC),
+                datetime(2026, 10, 2, 15, tzinfo=UTC),
+                datetime(2026, 10, 4, 15, tzinfo=UTC),
             ],
         }
     )
-    result = engagement_features(events, date(2026, 10, 3))
+    dim = pl.DataFrame({"customer_id": ["a", "b"], "tz": ["America/New_York"] * 2})
+    result = engagement_features(events, dim, date(2026, 10, 3))
     assert result["customer_id"].to_list() == ["a", "b"]
     assert result.select("app_open_count", "repayment_count").row(0) == (1, 1)
     assert not set(("recency", "frequency", "monetary")).intersection(result.columns)
@@ -237,13 +277,21 @@ def test_store_is_idempotent_frozen_and_adds_loaded_at(tmp_path):
 def test_late_events_are_counted_and_logged_for_next_snapshot(tmp_path):
     previous = date(2026, 11, 1)
     current = date(2026, 11, 2)
-    previous_cutoff = snapshot_cutoff_utc(previous)
-    current_cutoff = snapshot_cutoff_utc(current)
+    previous_cutoff = snapshot_cutoff_utc(previous, "America/New_York")
+    current_cutoff = snapshot_cutoff_utc(current, "America/New_York")
     assert previous_cutoff == datetime(2026, 11, 2, 4, 59, 59, tzinfo=UTC)
     assert current_cutoff == datetime(2026, 11, 3, 4, 59, 59, tzinfo=UTC)
     events = pl.DataFrame(
         {
-            "event_date_et": [previous, previous, previous, previous, previous, current],
+            "customer_id": ["a"] * 6,
+            "event_ts_utc": [
+                datetime(2026, 11, 1, 15, tzinfo=UTC),
+                datetime(2026, 11, 1, 15, tzinfo=UTC),
+                datetime(2026, 11, 1, 15, tzinfo=UTC),
+                datetime(2026, 11, 1, 15, tzinfo=UTC),
+                datetime(2026, 11, 1, 15, tzinfo=UTC),
+                datetime(2026, 11, 2, 15, tzinfo=UTC),
+            ],
             "loaded_at": [
                 previous_cutoff,
                 previous_cutoff + timedelta(hours=1),
@@ -253,11 +301,14 @@ def test_late_events_are_counted_and_logged_for_next_snapshot(tmp_path):
                 previous_cutoff + timedelta(hours=2),
             ],
         },
-        schema_overrides={"loaded_at": pl.Datetime("us", "UTC")},
+        schema_overrides={
+            "event_ts_utc": pl.Datetime("us", "UTC"),
+            "loaded_at": pl.Datetime("us", "UTC"),
+        },
     )
     assert events["loaded_at"].item(0) == previous_cutoff
     assert events["loaded_at"].item(2) == current_cutoff
-    count = count_late_events(events, previous, current)
+    count = count_late_events(events, _customers(), previous, current)
     assert count == 2
     store = GoldStore(tmp_path)
     next_snapshot = pl.DataFrame(
@@ -395,12 +446,12 @@ def test_truth_guard_is_called_by_every_feature_and_writer_entrypoint(tmp_path):
         {
             "customer_id": ["a"],
             "event_type": ["app_open"],
-            "event_date_et": [date(2026, 11, 1)],
+            "event_ts_utc": [datetime(2026, 11, 1, 15, tzinfo=UTC)],
             "responsiveness": [1.0],
         }
     )
     with pytest.raises(ValueError, match="simulation truth"):
-        engagement_features(events, date(2026, 11, 1))
+        engagement_features(events, _customers(), date(2026, 11, 1))
     features = _segment_features().with_columns(pl.lit(0).alias("cohort_day"))
     model, _ = fit_tiered(_segment_features())
     with pytest.raises(ValueError, match="simulation truth"):
@@ -432,8 +483,11 @@ def test_end_to_end_from_simulator():
     result = rfm_snapshot(
         tables["dim_customer"], tables["fact_transactions"], snapshot_date, WINDOWS
     )
-    expected = tables["dim_customer"].filter(pl.col("join_date") <= snapshot_date).height
-    assert tables["dim_customer"].filter(pl.col("join_date") > snapshot_date).height > 0
+    local = tables["dim_customer"].with_columns(
+        local_date_expr("joined_ts_utc", "tz").alias("join_local_date")
+    )
+    expected = local.filter(pl.col("join_local_date") <= snapshot_date).height
+    assert local.filter(pl.col("join_local_date") > snapshot_date).height > 0
     assert result.height == expected
     assert result["customer_id"].n_unique() == result.height
     assert result["frequency"].null_count() == 0

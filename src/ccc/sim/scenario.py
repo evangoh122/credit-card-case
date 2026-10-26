@@ -1,10 +1,10 @@
 import json
 import tomllib
 from dataclasses import dataclass, field, fields
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from ccc.timeutil import ET
+from ccc.timeutil import local_to_utc
 
 EVENTS = ("purchase", "app_open")
 
@@ -20,7 +20,7 @@ class Segment:
 @dataclass(frozen=True)
 class Campaign:
     name: str
-    start_et: str
+    start_local: str
     duration_days: int
     lift: float
     event: str = "purchase"
@@ -37,24 +37,32 @@ class Campaign:
             raise ValueError("test_share must be in (0, 1)")
         if self.duration_days < 1 or self.lift < 0 or self.arrival_boost < 0:
             raise ValueError("duration_days >= 1, lift >= 0, arrival_boost >= 0 required")
-        if self.end_utc <= self.start_utc:
+        if self.start_local_dt.tzinfo is not None:
+            raise ValueError("start_local is a local wall time and must not carry an offset")
+        if self.end_local_dt <= self.start_local_dt:
             raise ValueError("campaign must end after it starts")
 
     @property
-    def start_utc(self) -> datetime:
-        local = datetime.fromisoformat(self.start_et)
-        if local.tzinfo is not None:
-            raise ValueError("start_et is local ET wall time and must not carry an offset")
-        return local.replace(tzinfo=ET).astimezone(UTC)
+    def start_local_dt(self) -> datetime:
+        return datetime.fromisoformat(self.start_local)
 
     @property
-    def end_utc(self) -> datetime:
-        local = datetime.fromisoformat(self.start_et) + timedelta(days=self.duration_days)
-        return local.replace(tzinfo=ET).astimezone(UTC)
+    def end_local_dt(self) -> datetime:
+        return self.start_local_dt + timedelta(days=self.duration_days)
 
     @property
-    def start_date_et(self) -> date:
-        return datetime.fromisoformat(self.start_et).date()
+    def start_local_date(self) -> date:
+        return self.start_local_dt.date()
+
+    @property
+    def end_local_date(self) -> date:
+        return self.end_local_dt.date()
+
+    def local_bounds_utc(self, tz: str) -> tuple[datetime, datetime]:
+        return (
+            local_to_utc(self.start_local_dt, tz),
+            local_to_utc(self.end_local_dt, tz),
+        )
 
 
 @dataclass(frozen=True)
