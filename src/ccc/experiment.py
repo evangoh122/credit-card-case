@@ -32,8 +32,8 @@ def assign(
     root_seed: int,
     arms: Mapping[str, float] = DEFAULT_ARMS,
     *,
+    assigned_date: date,
     salt: int = 0,
-    assigned_date: date | None = None,
 ) -> pl.DataFrame:
     """Assign eligible customers to stable hash buckets within each segment."""
     items = _validate_arms(arms)
@@ -43,9 +43,10 @@ def assign(
         raise ValueError(f"missing required columns: {sorted(missing)}")
     if df.get_column("customer_id").n_unique() != df.height:
         raise ValueError("customer_id must be unique")
+    if df.get_column("segment").null_count():
+        raise ValueError("segment must not contain nulls")
 
     eligible = df.filter(pl.col("segment") != "Decline")
-    assignment_day = assigned_date or date.today()
     cumulative: list[tuple[str, float]] = []
     running = 0.0
     for name, weight in items:
@@ -60,7 +61,7 @@ def assign(
             if value < boundary:
                 arm = candidate
                 break
-        rows.append((customer_id, experiment_id, arm, assignment_day, stratum))
+        rows.append((customer_id, experiment_id, arm, assigned_date, stratum))
 
     schema = {
         "customer_id": df.schema["customer_id"],
@@ -136,9 +137,9 @@ def reseed(
     cols: Sequence[str] = DEFAULT_BALANCE_COLS,
     threshold: float = 0.1,
     max_salts: int = 100,
-    assigned_date: date | None = None,
+    assigned_date: date,
 ) -> tuple[pl.DataFrame, pl.DataFrame, int]:
-    """Try successive salts until all requested balance checks pass."""
+    """Choose a balanced salt before exposure; never reassign an active experiment."""
     if max_salts < 1:
         raise ValueError("max_salts must be at least 1")
     for salt in range(max_salts):
@@ -166,6 +167,10 @@ def sample_size_per_arm(
 ) -> int:
     """Return the normal-approximation sample size for a two-sided two-proportion test."""
     _validate_power_inputs(baseline_rate, mde, alpha, power)
+    return math.ceil(_required_n(baseline_rate, mde, alpha, power))
+
+
+def _required_n(baseline_rate: float, mde: float, alpha: float, power: float) -> float:
     alternative_rate = baseline_rate + mde
     midpoint = (baseline_rate + alternative_rate) / 2
     z_alpha = norm.ppf(1 - alpha / 2)
@@ -175,7 +180,7 @@ def sample_size_per_arm(
         + z_power
         * math.sqrt(baseline_rate * (1 - baseline_rate) + alternative_rate * (1 - alternative_rate))
     ) ** 2
-    return math.ceil(numerator / mde**2)
+    return numerator / mde**2
 
 
 def _validate_power_inputs(baseline_rate: float, mde: float, alpha: float, power: float) -> None:
@@ -200,18 +205,7 @@ def mde_for_n(
         raise ValueError("rates, alpha, and power must be valid probabilities")
 
     def difference(mde: float) -> float:
-        alternative_rate = baseline_rate + mde
-        midpoint = (baseline_rate + alternative_rate) / 2
-        z_alpha = norm.ppf(1 - alpha / 2)
-        z_power = norm.ppf(power)
-        required = (
-            z_alpha * math.sqrt(2 * midpoint * (1 - midpoint))
-            + z_power
-            * math.sqrt(
-                baseline_rate * (1 - baseline_rate) + alternative_rate * (1 - alternative_rate)
-            )
-        ) ** 2 / mde**2
-        return required - n_per_arm
+        return _required_n(baseline_rate, mde, alpha, power) - n_per_arm
 
     upper = 1 - baseline_rate - 1e-12
     if difference(upper) > 0:
@@ -234,6 +228,10 @@ def size_arms_per_segment(
         raise ValueError("total_customers and arm_count must be positive")
     if set(segment_shares) != set(baseline_rates):
         raise ValueError("segment_shares and baseline_rates must have the same keys")
+    if "Decline" in segment_shares:
+        raise ValueError("Decline must be excluded from experiment segment shares")
+    if any(not 0 <= share <= 1 for share in segment_shares.values()):
+        raise ValueError("segment shares must be between 0 and 1")
     if not math.isclose(sum(segment_shares.values()), 1.0, abs_tol=1e-12):
         raise ValueError("segment shares must sum to 1")
     rows = []
@@ -261,53 +259,98 @@ def uplift(
     alpha: float = 0.05,
 ) -> pl.DataFrame:
     """Estimate binary-outcome uplift against control by stratum and overall."""
-    joined = assignment.join(
-        outcomes.select("customer_id", outcome_col), on="customer_id", how="inner"
-    )
-    if joined.is_empty():
+    if outcomes.get_column("customer_id").n_unique() != outcomes.height:
+        raise ValueError("outcomes must contain at most one row per customer")
+    outcome_columns = ["customer_id", outcome_col]
+    if "immature" in outcomes.columns:
+        outcome_columns.append("immature")
+    joined = assignment.join(outcomes.select(outcome_columns), on="customer_id", how="left")
+    if joined.get_column(outcome_col).null_count() == joined.height:
         raise ValueError("assignment and outcomes have no customers in common")
+    joined = joined.with_columns(pl.col(outcome_col).cast(pl.Int8, strict=True))
     values = joined.get_column(outcome_col).drop_nulls()
-    if values.len() != joined.height or not values.is_in([0, 1, False, True]).all():
-        raise ValueError("outcome must be non-null and binary")
+    if not values.is_in([0, 1]).all():
+        raise ValueError("outcome must be binary")
+    if "immature" not in joined.columns:
+        joined = joined.with_columns(pl.lit(False).alias("immature"))
+    analysed = joined.filter(
+        pl.col(outcome_col).is_not_null() & ~pl.col("immature").fill_null(False)
+    )
     z = norm.ppf(1 - alpha / 2)
     rows = []
-    strata: list[str | None] = joined.get_column("stratum").unique(maintain_order=True).to_list()
-    for stratum in [*strata, None]:
-        group = joined if stratum is None else joined.filter(pl.col("stratum") == stratum)
-        control = group.filter(pl.col("arm") == "control")
-        if control.is_empty():
-            continue
-        control_rate = float(control.get_column(outcome_col).mean())
-        for arm in group.get_column("arm").unique(maintain_order=True).to_list():
-            if arm == "control":
+    estimates: dict[str, list[dict[str, float | int | str]]] = {}
+    strata = assignment.get_column("stratum").unique(maintain_order=True).to_list()
+    arms = assignment.filter(pl.col("arm") != "control").get_column("arm").unique().to_list()
+    for stratum in strata:
+        assigned_group = joined.filter(pl.col("stratum") == stratum)
+        analysed_group = analysed.filter(pl.col("stratum") == stratum)
+        control = analysed_group.filter(pl.col("arm") == "control")
+        for arm in arms:
+            treatment = analysed_group.filter(pl.col("arm") == arm)
+            if control.is_empty() or treatment.is_empty():
                 continue
-            treatment = group.filter(pl.col("arm") == arm)
+            control_rate = float(control.get_column(outcome_col).mean())
             treatment_rate = float(treatment.get_column(outcome_col).mean())
             effect = treatment_rate - control_rate
-            standard_error = math.sqrt(
+            variance = (
                 treatment_rate * (1 - treatment_rate) / treatment.height
                 + control_rate * (1 - control_rate) / control.height
             )
-            rows.append(
-                (
-                    stratum or "overall",
-                    arm,
-                    control.height,
-                    treatment.height,
-                    control_rate,
-                    treatment_rate,
-                    effect,
-                    effect - z * standard_error,
-                    effect + z * standard_error,
-                )
-            )
+            estimate = {
+                "stratum": stratum,
+                "arm": arm,
+                "stratum_size": assigned_group.height,
+                "n_control_assigned": assigned_group.filter(pl.col("arm") == "control").height,
+                "n_arm_assigned": assigned_group.filter(pl.col("arm") == arm).height,
+                "n_control_analysed": control.height,
+                "n_arm_analysed": treatment.height,
+                "control_rate": control_rate,
+                "arm_rate": treatment_rate,
+                "effect": effect,
+                "variance": variance,
+            }
+            estimates.setdefault(arm, []).append(estimate)
+            rows.append(_uplift_row(estimate, z))
+
+    for arm, arm_estimates in estimates.items():
+        total_size = sum(int(item["stratum_size"]) for item in arm_estimates)
+        weights = [int(item["stratum_size"]) / total_size for item in arm_estimates]
+        effect = sum(
+            weight * float(item["effect"])
+            for weight, item in zip(weights, arm_estimates, strict=True)
+        )
+        variance = sum(
+            weight**2 * float(item["variance"])
+            for weight, item in zip(weights, arm_estimates, strict=True)
+        )
+        overall = {
+            "stratum": "overall",
+            "arm": arm,
+            "n_control_assigned": sum(int(item["n_control_assigned"]) for item in arm_estimates),
+            "n_arm_assigned": sum(int(item["n_arm_assigned"]) for item in arm_estimates),
+            "n_control_analysed": sum(int(item["n_control_analysed"]) for item in arm_estimates),
+            "n_arm_analysed": sum(int(item["n_arm_analysed"]) for item in arm_estimates),
+            "control_rate": sum(
+                weight * float(item["control_rate"])
+                for weight, item in zip(weights, arm_estimates, strict=True)
+            ),
+            "arm_rate": sum(
+                weight * float(item["arm_rate"])
+                for weight, item in zip(weights, arm_estimates, strict=True)
+            ),
+            "effect": effect,
+            "variance": variance,
+        }
+        rows.append(_uplift_row(overall, z))
     return pl.DataFrame(
         rows,
         schema={
             "stratum": pl.String,
             "arm": pl.String,
-            "n_control": pl.Int64,
-            "n_arm": pl.Int64,
+            "n_control_assigned": pl.Int64,
+            "n_arm_assigned": pl.Int64,
+            "n_control_analysed": pl.Int64,
+            "n_arm_analysed": pl.Int64,
             "control_rate": pl.Float64,
             "arm_rate": pl.Float64,
             "uplift": pl.Float64,
@@ -318,25 +361,39 @@ def uplift(
     )
 
 
+def _uplift_row(estimate: Mapping[str, float | int | str], z: float) -> tuple:
+    standard_error = math.sqrt(float(estimate["variance"]))
+    effect = float(estimate["effect"])
+    return (
+        estimate["stratum"],
+        estimate["arm"],
+        estimate["n_control_assigned"],
+        estimate["n_arm_assigned"],
+        estimate["n_control_analysed"],
+        estimate["n_arm_analysed"],
+        estimate["control_rate"],
+        estimate["arm_rate"],
+        effect,
+        effect - z * standard_error,
+        effect + z * standard_error,
+    )
+
+
 def tenure_outcomes(
     events: pl.DataFrame,
     assignment: pl.DataFrame,
     window_days: int,
     *,
+    as_of_date: date,
     event_date_col: str = "event_date",
-    as_of_date: date | None = None,
 ) -> pl.DataFrame:
     """Reduce events to equal-tenure customer outcomes and flag incomplete windows."""
     if window_days < 1:
         raise ValueError("window_days must be positive")
     if event_date_col not in events.columns:
         raise ValueError(f"missing event date column {event_date_col!r}")
-    observed_through = as_of_date or events.get_column(event_date_col).max()
-    if observed_through is None:
-        raise ValueError("as_of_date is required when events is empty")
-
     base = assignment.with_columns(
-        ((pl.lit(observed_through) - pl.col("assigned_date")).dt.total_days() < window_days).alias(
+        (pl.lit(as_of_date) < pl.col("assigned_date") + pl.duration(days=window_days - 1)).alias(
             "immature"
         )
     )

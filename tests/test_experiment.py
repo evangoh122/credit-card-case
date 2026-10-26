@@ -2,12 +2,15 @@ from datetime import date, timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 
 from ccc.experiment import (
     assign,
     balance_check,
     mde_for_n,
+    reseed,
     sample_size_per_arm,
+    size_arms_per_segment,
     tenure_outcomes,
     uplift,
 )
@@ -74,6 +77,72 @@ def test_balance_check_detects_deliberately_skewed_split() -> None:
     assert not result.row(0, named=True)["balanced"]
 
 
+def test_balance_check_accepts_a_genuinely_balanced_assignment() -> None:
+    source = pl.DataFrame(
+        {
+            "customer_id": ["c1", "c2", "t1", "t2"],
+            "pre_spend": [10.0, 20.0, 10.0, 20.0],
+        }
+    )
+    assignment = pl.DataFrame(
+        {
+            "customer_id": source["customer_id"],
+            "experiment_id": ["balanced"] * 4,
+            "arm": ["control", "control", "test", "test"],
+            "assigned_date": [date(2026, 1, 1)] * 4,
+            "stratum": ["Prime"] * 4,
+        }
+    )
+
+    result = balance_check(source, assignment, cols=["pre_spend"])
+
+    assert result.row(0, named=True)["smd"] == 0
+    assert result.row(0, named=True)["balanced"]
+
+
+def test_reseed_uses_zero_for_balance_and_advances_only_for_imbalance() -> None:
+    source = customers(800).filter(pl.col("segment") == "Prime")
+    source = source.with_columns(pl.lit(1.0).alias("pre_spend"))
+    _, balanced, salt = reseed(
+        source,
+        "balanced",
+        12,
+        cols=["pre_spend"],
+        assigned_date=date(2026, 1, 1),
+    )
+    assert salt == 0
+    assert balanced.get_column("balanced").all()
+
+    initial = assign(source, "advance", 12, assigned_date=date(2026, 1, 1))
+    skewed = source.with_columns(
+        pl.col("customer_id")
+        .is_in(initial.filter(pl.col("arm") == "test")["customer_id"].implode())
+        .cast(pl.Float64)
+        .alias("pre_spend")
+    )
+    _, recovered, salt = reseed(
+        skewed,
+        "advance",
+        12,
+        cols=["pre_spend"],
+        threshold=0.3,
+        assigned_date=date(2026, 1, 1),
+    )
+    assert salt > 0
+    assert recovered.get_column("balanced").all()
+
+    with pytest.raises(RuntimeError, match="no balanced assignment"):
+        reseed(
+            skewed,
+            "advance",
+            12,
+            cols=["pre_spend"],
+            threshold=0.3,
+            max_salts=1,
+            assigned_date=date(2026, 1, 1),
+        )
+
+
 def test_power_matches_textbook_normal_approximation_and_inverts() -> None:
     required = sample_size_per_arm(0.10, 0.05, alpha=0.05, power=0.80)
 
@@ -81,10 +150,38 @@ def test_power_matches_textbook_normal_approximation_and_inverts() -> None:
     assert abs(mde_for_n(0.10, required) - 0.05) < 0.0001
 
 
+def test_size_arms_per_segment_floors_capacity_and_compares_power() -> None:
+    result = size_arms_per_segment(
+        {"Prime": 0.333, "Watch": 0.667},
+        {"Prime": 0.10, "Watch": 0.10},
+        total_customers=3_001,
+        mde=0.05,
+    ).sort("segment")
+
+    prime, watch = result.iter_rows(named=True)
+    assert prime["available_per_arm"] == 499
+    assert watch["available_per_arm"] == 1_000
+    assert not prime["powered"]
+    assert watch["powered"]
+
+
+@pytest.mark.parametrize(
+    ("shares", "rates", "message"),
+    [
+        ({"Prime": 0.8}, {"Prime": 0.1}, "sum to 1"),
+        ({"Prime": 1.1, "Watch": -0.1}, {"Prime": 0.1, "Watch": 0.1}, "between 0 and 1"),
+        ({"Prime": 0.8, "Decline": 0.2}, {"Prime": 0.1, "Decline": 0.1}, "Decline"),
+    ],
+)
+def test_size_arms_per_segment_validates_eligible_shares(shares, rates, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        size_arms_per_segment(shares, rates, mde=0.05)
+
+
 def test_uplift_confidence_interval_covers_planted_effect_over_seeds() -> None:
     assignment = assign(customers(8_000), "offer-3", 11, assigned_date=date(2026, 1, 1))
     covered = 0
-    for seed in range(10):
+    for seed in range(20):
         rng = np.random.default_rng(seed)
         probabilities = np.where(assignment["arm"].to_numpy() == "test", 0.25, 0.20)
         outcomes = pl.DataFrame(
@@ -95,31 +192,96 @@ def test_uplift_confidence_interval_covers_planted_effect_over_seeds() -> None:
         )
         covered += overall["ci_low"] <= 0.05 <= overall["ci_high"]
 
-    assert covered >= 9
+    assert covered >= 18
 
 
-def test_tenure_outcomes_uses_exposure_date_and_flags_immature() -> None:
+def test_uplift_filters_immature_and_reports_assignment_attrition() -> None:
     assignment = pl.DataFrame(
         {
-            "customer_id": ["mature", "immature"],
-            "experiment_id": ["offer", "offer"],
-            "arm": ["control", "test"],
-            "assigned_date": [date(2026, 1, 1), date(2026, 1, 20)],
-            "stratum": ["Prime", "Prime"],
+            "customer_id": ["c1", "c2", "t1", "t2"],
+            "experiment_id": ["offer"] * 4,
+            "arm": ["control", "control", "test", "test"],
+            "assigned_date": [date(2026, 1, 1)] * 4,
+            "stratum": ["Prime"] * 4,
+        }
+    )
+    outcomes = pl.DataFrame(
+        {
+            "customer_id": ["c1", "c2", "t1"],
+            "outcome": [False, True, True],
+            "immature": [False, True, False],
+        }
+    )
+
+    result = uplift(outcomes, assignment).filter(pl.col("stratum") == "Prime").row(0, named=True)
+
+    assert result["n_control_assigned"] == 2
+    assert result["n_arm_assigned"] == 2
+    assert result["n_control_analysed"] == 1
+    assert result["n_arm_analysed"] == 1
+    assert result["control_rate"] == 0
+    assert result["arm_rate"] == 1
+
+
+def test_overall_uplift_is_weighted_by_stratum_size_not_pooled_arm_mix() -> None:
+    rows = []
+    outcomes = []
+    for stratum, arm, count, successes in [
+        ("A", "control", 40, 4),
+        ("A", "test", 10, 2),
+        ("B", "control", 10, 8),
+        ("B", "test", 40, 36),
+    ]:
+        for index in range(count):
+            customer_id = f"{stratum}-{arm}-{index}"
+            rows.append((customer_id, "offer", arm, date(2026, 1, 1), stratum))
+            outcomes.append((customer_id, index < successes))
+    assignment = pl.DataFrame(
+        rows,
+        schema=["customer_id", "experiment_id", "arm", "assigned_date", "stratum"],
+        orient="row",
+    )
+    outcome_frame = pl.DataFrame(outcomes, schema=["customer_id", "outcome"], orient="row")
+
+    overall = (
+        uplift(outcome_frame, assignment).filter(pl.col("stratum") == "overall").row(0, named=True)
+    )
+
+    assert overall["uplift"] == pytest.approx(0.1)
+    assert overall["uplift"] != pytest.approx(0.52)
+
+
+def test_tenure_outcomes_enforces_window_and_maturity_boundaries() -> None:
+    assignment = pl.DataFrame(
+        {
+            "customer_id": ["mature", "boundary", "immature"],
+            "experiment_id": ["offer"] * 3,
+            "arm": ["control", "test", "control"],
+            "assigned_date": [date(2026, 1, 1), date(2026, 1, 3), date(2026, 1, 4)],
+            "stratum": ["Prime", "Watch", "Nurture"],
         }
     )
     events = pl.DataFrame(
         {
-            "customer_id": ["mature", "mature", "immature"],
+            "customer_id": ["mature", "mature", "mature", "boundary", "immature"],
             "event_date": [
-                date(2026, 1, 1) + timedelta(days=3),
-                date(2026, 1, 1) + timedelta(days=40),
-                date(2026, 1, 25),
+                date(2025, 12, 31),
+                date(2026, 1, 1) + timedelta(days=4),
+                date(2026, 1, 1) + timedelta(days=5),
+                date(2026, 1, 3) + timedelta(days=4),
+                date(2026, 1, 4),
             ],
         }
     )
-    result = tenure_outcomes(events, assignment, 30, as_of_date=date(2026, 2, 1))
+    result = tenure_outcomes(events, assignment, 5, as_of_date=date(2026, 1, 7))
 
-    assert result.filter(pl.col("customer_id") == "mature").row(0, named=True)["event_count"] == 1
-    assert not result.filter(pl.col("customer_id") == "mature").row(0, named=True)["immature"]
-    assert result.filter(pl.col("customer_id") == "immature").row(0, named=True)["immature"]
+    by_customer = {row["customer_id"]: row for row in result.iter_rows(named=True)}
+    assert by_customer["mature"]["event_count"] == 1
+    assert by_customer["mature"]["outcome"] == 1
+    assert not by_customer["mature"]["immature"]
+    assert by_customer["boundary"]["event_count"] == 1
+    assert by_customer["boundary"]["outcome"] == 1
+    assert not by_customer["boundary"]["immature"]
+    assert by_customer["immature"]["event_count"] == 1
+    assert by_customer["immature"]["outcome"] == 1
+    assert by_customer["immature"]["immature"]
