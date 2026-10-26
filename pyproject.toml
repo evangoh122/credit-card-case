@@ -4,10 +4,12 @@ version = "0.1.0"
 description = "Credit card case: segmentation, offer experiments and drift monitoring on a seeded simulation"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "faker>=40.43.0",
     "numpy",
     "polars",
     "scikit-learn",
     "scipy",
+    "sdv>=2.0.0",
 ]
 
 [dependency-groups]
@@ -25,6 +27,8 @@ packages = ["src/ccc"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = ["slow: fits SDV synthesizers; run with -m slow"]
 
 [tool.ruff]
 line-length = 100
