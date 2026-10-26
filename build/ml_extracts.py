@@ -30,7 +30,7 @@ import pandas as pd
 import polars as pl
 
 from . import config as C
-from .utils import log, write_parquet
+from .utils import log, rng_for, write_parquet
 
 ML = C.OUT / C.ML_DIR_NAME
 RNG = np.random.default_rng(C.SEED + 7007)
@@ -158,34 +158,41 @@ def _attach_velocity(df: pd.DataFrame) -> pd.DataFrame:
     """Strictly as-of velocity features: later transactions never change earlier rows.
 
     Transactions of one customer are ordered by (``transaction_ts``,
-    ``transaction_id``); that order is the stable tiebreak for equal timestamps.
+    ``transaction_id``); rows with equal timestamps therefore see the rows with a
+    smaller id (running sums) but never the ones with a larger id.
 
     * ``customer_day_txn_count`` - this customer's transactions on the same
       ``transaction_date`` up to and including the current one (running count).
-    * ``customer_week_spend`` - sum of this customer's ``amount_usd`` over the
-      trailing 7 days up to and including the current transaction, i.e.
-      timestamps in ``(ts - 7 days, ts]`` (a rolling window, not the calendar
-      week bucket, which needs the whole week).
+    * ``customer_week_spend`` - sum of this customer's ``amount_usd`` over
+      timestamps in ``(ts - 7 days, ts]`` up to and including the current row
+      (a row exactly 7 days earlier is excluded). Evaluated on the REAL
+      timestamps: a per-customer cumulative sum in (ts, id) order minus the
+      cumulative sum through the last row with ``ts <= current_ts - 7 days``
+      (``join_asof`` on real timestamps, no timestamp nudging).
     * ``days_since_first_txn`` - days since the customer's first transaction
       (always earlier than the current row, so it is as-of already).
     """
     cols = ["customer_id", "transaction_id", "transaction_ts", "transaction_date", "amount_usd"]
     work = pl.from_pandas(df[cols].reset_index(drop=True)).with_row_index("_row")
-    work = work.sort(["customer_id", "transaction_ts", "transaction_id"])
-    # a strictly increasing key (1 ns steps among equal timestamps) makes the rolling
-    # window honour the (ts, id) tiebreak instead of including later rows with the same ts
-    key = (pl.col("transaction_ts")
-           + pl.duration(nanoseconds=pl.int_range(pl.len()).over(["customer_id", "transaction_ts"])))
-    work = work.with_columns(_key=key.cast(pl.Datetime("ns")))
-    out = work.with_columns(
+    work = work.sort(["customer_id", "transaction_ts", "transaction_id"]).with_columns(
+        pl.col("amount_usd").cast(pl.Float64).cum_sum().over("customer_id").alias("_cs"))
+    # cumulative sum at the END of each (customer, timestamp) group, probed at ts - 7d
+    ends = (work.group_by(["customer_id", "transaction_ts"])
+            .agg(pl.col("_cs").last().alias("_cs_end")).sort("transaction_ts"))
+    probe = work.select(
+        "_row", "customer_id",
+        (pl.col("transaction_ts") - pl.duration(days=7)).cast(
+            work.schema["transaction_ts"]).alias("_edge")).sort("_edge")
+    before = probe.join_asof(
+        ends, left_on="_edge", right_on="transaction_ts", by="customer_id",
+        strategy="backward").select("_row", pl.col("_cs_end").fill_null(0.0).alias("_before"))
+    date_ns = pl.col("transaction_date").cast(pl.Datetime("ns"))
+    out = work.join(before, on="_row", how="left").with_columns(
         pl.int_range(1, pl.len() + 1).over(
             ["customer_id", pl.col("transaction_date").cast(pl.Date)]
         ).cast(pl.Int64).alias("customer_day_txn_count"),
-        pl.col("amount_usd").cast(pl.Float64).rolling_sum_by(
-            "_key", window_size="7d", closed="right").over("customer_id")
-        .alias("customer_week_spend"),
-        (pl.col("transaction_date").cast(pl.Datetime("ns"))
-         - pl.col("transaction_date").cast(pl.Datetime("ns")).min().over("customer_id")
+        (pl.col("_cs") - pl.col("_before")).alias("customer_week_spend"),
+        (date_ns - date_ns.min().over("customer_id")
          ).dt.total_days().cast(pl.Int64).alias("days_since_first_txn"),
     ).sort("_row")
     df = df.copy()
@@ -193,6 +200,22 @@ def _attach_velocity(df: pd.DataFrame) -> pd.DataFrame:
     df["customer_week_spend"] = out["customer_week_spend"].to_numpy()
     df["days_since_first_txn"] = out["days_since_first_txn"].to_numpy()
     return df
+
+
+def _synthetic_velocity(history: pd.DataFrame, synth: pd.DataFrame) -> pd.DataFrame:
+    """As-of velocity for backdated synthetic rows on their own timeline.
+
+    The synthetic rows are inserted into the real transaction timeline of their
+    customers (``history`` = full operational purchases) and the same as-of
+    function is run; only the synthetic rows' values are returned, real rows are
+    never altered. They see earlier real rows (and earlier synthetic rows) only.
+    """
+    cols = ["customer_id", "transaction_id", "transaction_ts", "transaction_date", "amount_usd"]
+    hist = history.loc[history.customer_id.isin(set(synth.customer_id)), cols]
+    both = pd.concat([hist, synth[cols]], ignore_index=True)
+    v = _attach_velocity(both).set_index("transaction_id")
+    return v.loc[synth.transaction_id,
+                 ["customer_day_txn_count", "customer_week_spend", "days_since_first_txn"]]
 
 
 def _assign_fraud_type(df: pd.DataFrame, rng: np.random.Generator) -> pd.Series:
@@ -217,6 +240,34 @@ def _assign_fraud_type(df: pd.DataFrame, rng: np.random.Generator) -> pd.Series:
             ["CARD_NOT_PRESENT", "ACCOUNT_TAKEOVER", "COUNTERFEIT"],
             size=len(late_idx), p=[0.58, 0.30, 0.12])
     return pd.Series(types, index=df.index)
+
+
+def _asof_synthetic_features(history: pd.DataFrame, syn: pd.DataFrame) -> pd.DataFrame:
+    """Recompute every time-dependent feature of backdated synthetic rows as-of their own time.
+
+    The synthetic test purchases are copies of a later fraud transaction moved
+    back in time, so anything derived from time must not be inherited from that
+    later row. Velocity (day count, 7-day spend, days since first transaction)
+    is recomputed on the customer's real timeline with the synthetic row inserted
+    at its own timestamp (``_synthetic_velocity``); ``split_time`` follows the row's
+    own date; ``device_risk_score`` uses the row's own hour and regime (its noise
+    comes from a dedicated stream so the main ML stream is unchanged).
+    """
+    syn = syn.copy()
+    vel = _synthetic_velocity(history, syn)
+    for col in vel.columns:
+        syn[col] = vel[col].to_numpy()
+    syn["customer_week_spend_log"] = np.log1p(syn.customer_week_spend.clip(lower=0))
+    late = (pd.to_datetime(syn.transaction_date) >= pd.Timestamp(C.ML_FRAUD_OOT_START)).to_numpy()
+    syn["split_time"] = np.where(late, "test", "train")
+    base_risk = (0.12 + 0.30 * (~syn.is_card_present.astype(bool))
+                 + 0.15 * syn.is_international.astype(bool)
+                 + 0.10 * (syn.hour <= 5)
+                 + 0.10 * syn.category.isin(
+                     ["Entertainment", "Electronics", "Digital", "E-Commerce"]))
+    noise = rng_for("fraud_synthetic_device_risk").normal(0, 0.05, len(syn))
+    syn["device_risk_score"] = np.clip(base_risk.to_numpy(float) + 0.42 * late + noise, 0, 1)
+    return syn
 
 
 def build_fraud(df: pd.DataFrame) -> dict:
@@ -335,7 +386,6 @@ def build_fraud(df: pd.DataFrame) -> dict:
             paired_fraud_transaction_id=r.transaction_id,
         )
         syn["amount_log"] = np.log1p(syn["amount_usd"])
-        syn["customer_week_spend_log"] = np.log1p(max(0.0, r.customer_week_spend))
         synth_rows.append(syn)
         sample.at[idx, "is_test_purchase_sequence"] = True
         sample.at[idx, "test_transaction_id"] = syn_id
@@ -346,7 +396,8 @@ def build_fraud(df: pd.DataFrame) -> dict:
                           test_amount=syn["amount_usd"],
                           fraud_amount=float(r.amount_usd), origin="synthetic"))
     if synth_rows:
-        sample = pd.concat([sample, pd.DataFrame(synth_rows)], ignore_index=True)
+        syn_df = _asof_synthetic_features(df, pd.DataFrame(synth_rows))
+        sample = pd.concat([sample, syn_df], ignore_index=True)
 
     sequences = pd.DataFrame(pairs)
     sample = sample.sort_values(["transaction_date", "transaction_id"]).reset_index(drop=True)
