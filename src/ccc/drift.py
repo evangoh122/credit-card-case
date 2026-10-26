@@ -42,9 +42,13 @@ def _floats(values: Values) -> np.ndarray:
     return arr[~np.isnan(arr)]
 
 
+def _is_null(v: object) -> bool:
+    return v is None or (isinstance(v, float | np.floating) and bool(np.isnan(v)))
+
+
 def _labels(values: Values) -> list[str]:
     items = values.to_list() if isinstance(values, pl.Series) else list(values)
-    return [str(v) for v in items if v is not None and not (isinstance(v, float) and v != v)]
+    return [str(v) for v in items if not _is_null(v)]
 
 
 def _shares(counts: Counter, keys: Sequence[str]) -> list[float]:
