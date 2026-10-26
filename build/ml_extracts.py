@@ -242,6 +242,18 @@ def _assign_fraud_type(df: pd.DataFrame, rng: np.random.Generator) -> pd.Series:
     return pd.Series(types, index=df.index)
 
 
+def _backdated_test_purchase_ts(fraud_date: pd.Timestamp) -> pd.Timestamp:
+    """Timestamp of the ML-only test purchase paired with a fraud on ``fraud_date``.
+
+    The test purchase happens on the calendar day BEFORE the fraud (the recorded
+    ``test_purchase_gap_days`` is 1.0) at 22:00, i.e. two hours before that day
+    ends. ``transaction_date`` is always the calendar date of this timestamp, so
+    date, hour, split and regime all describe one consistent moment. (Before
+    round 8 the timestamp was a further day earlier than ``transaction_date``.)
+    """
+    return pd.Timestamp(fraud_date).normalize() - pd.Timedelta(hours=2)
+
+
 def _asof_synthetic_features(history: pd.DataFrame, syn: pd.DataFrame) -> pd.DataFrame:
     """Recompute every time-dependent feature of backdated synthetic rows as-of their own time.
 
@@ -251,14 +263,19 @@ def _asof_synthetic_features(history: pd.DataFrame, syn: pd.DataFrame) -> pd.Dat
     is recomputed on the customer's real timeline with the synthetic row inserted
     at its own timestamp (``_synthetic_velocity``); ``split_time`` follows the row's
     own date; ``device_risk_score`` uses the row's own hour and regime (its noise
-    comes from a dedicated stream so the main ML stream is unchanged).
+    comes from a dedicated stream so the main ML stream is unchanged). ``transaction_date``
+    and ``hour`` are re-derived from ``transaction_ts`` so they cannot disagree with it.
     """
     syn = syn.copy()
+    # one consistent moment: date and hour are derived from the row's own timestamp
+    ts = pd.to_datetime(syn.transaction_ts)
+    syn["transaction_date"] = ts.dt.normalize()
+    syn["hour"] = ts.dt.hour.astype(syn.hour.dtype)
     vel = _synthetic_velocity(history, syn)
     for col in vel.columns:
         syn[col] = vel[col].to_numpy()
     syn["customer_week_spend_log"] = np.log1p(syn.customer_week_spend.clip(lower=0))
-    late = (pd.to_datetime(syn.transaction_date) >= pd.Timestamp(C.ML_FRAUD_OOT_START)).to_numpy()
+    late = (ts >= pd.Timestamp(C.ML_FRAUD_OOT_START)).to_numpy()   # from the timestamp itself
     syn["split_time"] = np.where(late, "test", "train")
     base_risk = (0.12 + 0.30 * (~syn.is_card_present.astype(bool))
                  + 0.15 * syn.is_international.astype(bool)
@@ -371,13 +388,13 @@ def build_fraud(df: pd.DataFrame) -> dict:
     synth_rows = []
     for n, (idx, r) in enumerate(unmatched.iterrows(), start=1):
         syn_id = f"SYNTEST{n:08d}"
-        fraud_date = pd.Timestamp(r.transaction_date)
+        syn_ts = _backdated_test_purchase_ts(pd.Timestamp(r.transaction_date))
         syn = dict(r)
         syn.update(
             transaction_id=syn_id,
-            transaction_date=fraud_date - pd.Timedelta(days=1),
-            transaction_ts=fraud_date - pd.Timedelta(days=1, hours=2),
-            hour=int((fraud_date - pd.Timedelta(days=1, hours=2)).hour),
+            transaction_date=syn_ts.normalize(),
+            transaction_ts=syn_ts,
+            hour=int(syn_ts.hour),
             amount_usd=round(float(min(4.0, max(0.50, r.amount_usd * 0.01))), 2),
             fraud_type="NONE", label_true=0, label_noisy=0, label_noise="NONE",
             is_fraud=False, is_test_purchase_sequence=False,
