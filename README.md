@@ -144,7 +144,10 @@ dates. Tests: `tests/test_v7_asof_payments.py`. Round 6: the status replay uses 
 `_waterfall`/`_settled_closing_amounts`/`_stmt_status`; fraud velocity features are
 strictly as-of (running day count, trailing-7-day spend); the forecast extract has
 train/test months with merchant selection and `seasonal_index` from train months
-only (`C.ML_FORECAST_TEST_START`). Tests: `tests/test_v7_round6_asof_extracts.py`. Tests: `tests/test_v7_polars_fixes.py`. Runtime ≈ 55 minutes for 50k customers.
+only (`C.ML_FORECAST_TEST_START`). Tests: `tests/test_v7_round6_asof_extracts.py`. Round 7: the 7-day window is evaluated on real timestamps with exact
+`(ts - 7d, ts]` bounds (equal timestamps ordered by id via running sums), and the
+backdated synthetic test-purchase rows recompute velocity, `split_time` and
+`device_risk_score` as-of their own time. Tests: `tests/test_v7_round7_velocity.py`. Tests: `tests/test_v7_polars_fixes.py`. Runtime ≈ 55 minutes for 50k customers.
 
 ---
 
