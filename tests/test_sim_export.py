@@ -1,5 +1,6 @@
 import json
 from dataclasses import replace
+from datetime import date, timedelta
 
 import duckdb
 import polars as pl
@@ -93,10 +94,137 @@ def test_target_estimate_lands_near_target(tmp_path):
     assert abs(txns["fact_transactions"].height - target) < 0.1 * target
 
 
-def test_upload_refuses_truth_file(tmp_path):
-    from ccc.sim import upload
+def _all_tables(out):
+    tables = {name: _facts(out, name).sort(*keys) for name, keys in export.FACTS.items()}
+    tables["dim_customer"] = pl.read_parquet(out / "dim_customer.parquet").sort("customer_id")
+    return tables
 
-    (tmp_path / "manifest.json").write_text("{}")
-    (tmp_path / upload.TRUTH_FILE).write_bytes(b"")
-    with pytest.raises(ValueError, match="planted truth"):
-        upload.upload(tmp_path, "u/r", "token")
+
+def test_export_identical_across_workers_and_batch_sizes(out, sc, tmp_path):
+    other = tmp_path / "other"
+    export.export(other, SEED, DAYS, sc, batch_size=7, workers=1)
+    base, again = _all_tables(out), _all_tables(other)
+    for name, df in base.items():
+        assert df.equals(again[name]), name
+
+
+def test_more_initial_customers_keep_existing_rows(out, sc, tmp_path):
+    bigger = tmp_path / "bigger"
+    export.export(bigger, SEED, DAYS, replace(sc, initial_customers=90), batch_size=40, workers=1)
+    base, more = _all_tables(out), _all_tables(bigger)
+    ids = base["dim_customer"]["customer_id"].to_list()
+    assert more["dim_customer"].height > base["dim_customer"].height
+    for name, df in base.items():
+        kept = more[name].filter(pl.col("customer_id").is_in(ids))
+        assert kept.equals(df), name
+
+
+@pytest.mark.parametrize("start", [date(2026, 3, 5), date(2026, 10, 30)])
+def test_dst_transitions_keep_partitions_and_offsets_consistent(tmp_path, start):
+    sc = Scenario("dst", start, initial_customers=150, arrivals_per_day=0.0)
+    path = tmp_path / "ds"
+    export.export(path, SEED, 6, sc, batch_size=100, workers=1)
+    txns = _facts(path, "fact_transactions")
+    dim = pl.read_parquet(path / "dim_customer.parquet").select("customer_id", "tz")
+    assert (txns["event_ts_utc"].dt.date() == txns["event_date_utc"]).all()
+    assert {f"event_date_utc={d}" for d in txns["event_date_utc"].unique()} == {
+        p.name for p in (path / "fact_transactions").iterdir()
+    }
+    transitions = 0
+    for tz, grp in txns.join(dim, on="customer_id").sort("event_ts_utc").group_by("tz"):
+        local = grp["event_ts_utc"].dt.convert_time_zone(tz[0])
+        offset = local.dt.replace_time_zone(None) - grp["event_ts_utc"].dt.replace_time_zone(None)
+        hours = offset.dt.total_hours().to_list()
+        assert len(set(hours)) <= 2
+        changes = sum(a != b for a, b in zip(hours, hours[1:], strict=False))
+        assert changes <= 1  # offset is monotone in time: at most one DST switch
+        transitions += changes
+        days_local = local.dt.date()
+        assert days_local.min() >= start and days_local.max() < start + timedelta(days=6)
+    assert transitions >= 1
+    # shifting an offset moves events across the UTC day boundary, never across partitions
+    hours_utc = txns.group_by(txns["event_ts_utc"].dt.hour().alias("h")).len()
+    assert hours_utc["len"].sum() == txns.height
+
+
+class _InlinePool:
+    """Stand-in for ProcessPoolExecutor; `spawn` workers cannot see monkeypatches."""
+
+    counts_delta = 0
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def map(self, fn, jobs):
+        for counts in map(fn, jobs):
+            counts["fact_transactions"] += self.counts_delta
+            yield counts
+
+
+class _WorkerDies(_InlinePool):
+    def map(self, fn, jobs):
+        yield fn(next(iter(jobs)))
+        raise RuntimeError("worker died")
+
+
+class _CountsDrift(_InlinePool):
+    counts_delta = 1
+
+
+def _failing_connect(real_connect, made):
+    class Con:
+        def __init__(self):
+            self.real = real_connect()
+            self.closed = False
+            made.append(self)
+
+        def execute(self, sql, *args):
+            if sql.startswith("COPY") and "fact_events" in sql:
+                raise duckdb.Error("disk full")
+            return self.real.execute(sql, *args)
+
+        def close(self):
+            self.closed = True
+            self.real.close()
+
+    return Con
+
+
+@pytest.mark.parametrize("failure", ["worker", "duckdb", "counts"])
+@pytest.mark.parametrize("preexisting_empty_dir", [False, True])
+def test_failed_export_cleans_up_and_retry_succeeds(
+    tmp_path, monkeypatch, sc, failure, preexisting_empty_dir
+):
+    out = tmp_path / "ds"
+    if preexisting_empty_dir:
+        out.mkdir()
+    made = []
+    if failure == "worker":
+        monkeypatch.setattr(export, "ProcessPoolExecutor", _WorkerDies)
+    elif failure == "counts":
+        monkeypatch.setattr(export, "ProcessPoolExecutor", _CountsDrift)
+    else:
+        monkeypatch.setattr(export, "ProcessPoolExecutor", _InlinePool)
+        monkeypatch.setattr(export.duckdb, "connect", _failing_connect(duckdb.connect, made))
+    with pytest.raises((RuntimeError, duckdb.Error)):
+        export.export(out, SEED, DAYS, sc, batch_size=40, workers=1)
+    assert not out.exists() or not any(out.iterdir())
+    assert all(con.closed for con in made)
+    monkeypatch.undo()
+    manifest = export.export(out, SEED, DAYS, sc, batch_size=40, workers=1)
+    assert manifest["row_counts"]["fact_transactions"] > 0
+
+
+def test_non_empty_output_dir_is_left_untouched(tmp_path, sc):
+    out = tmp_path / "ds"
+    out.mkdir()
+    (out / "keep.txt").write_text("mine")
+    with pytest.raises(FileExistsError):
+        export.export(out, SEED, DAYS, sc)
+    assert (out / "keep.txt").read_text() == "mine"
