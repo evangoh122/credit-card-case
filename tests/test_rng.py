@@ -3,6 +3,9 @@ import pytest
 
 from ccc.rng import STREAMS, entity_rng, unit_hash
 
+PIN_UNIT = 0.04396681854015525
+PIN_DRAW = 0.19074376189935172
+
 
 def draw(*args, n=5):
     return entity_rng(*args).random(n)
@@ -49,6 +52,24 @@ def test_unit_hash_stable_and_in_range():
     assert unit_hash(1, "assign", "c1") != unit_hash(1, "other", "c1")
 
 
-def test_unit_hash_pinned_value():
-    # Guards against accidental changes to the hash scheme, which would reshuffle assignments.
-    assert unit_hash(1, "assign", "c1") == pytest.approx(0.48709684545738985)
+def test_int_and_str_ids_differ():
+    assert unit_hash(1, "assign", 1) != unit_hash(1, "assign", "1")
+    assert not np.array_equal(draw(1, "behavior", 1, 0), draw(1, "behavior", "1", 0))
+
+
+def test_delimiter_in_ids_does_not_collide():
+    assert unit_hash(1, "a\x1fb", "c") != unit_hash(1, "a", "b\x1fc")
+    assert unit_hash(1, "ab", "c") != unit_hash(1, "a", "bc")
+    assert unit_hash(1, "assign", "1|2") != unit_hash(1, "assign|1", "2")
+
+
+def test_unsupported_key_types_rejected():
+    for bad in (1.5, True, None):
+        with pytest.raises(TypeError):
+            unit_hash(1, "assign", bad)
+
+
+def test_pinned_values():
+    # Guards the hash scheme; changing it would reshuffle every assignment and draw.
+    assert unit_hash(1, "assign", "c1") == PIN_UNIT
+    assert entity_rng(1, "behavior", "c1", 0).random() == PIN_DRAW

@@ -34,12 +34,19 @@ def add_business_days(start: date, n: int) -> date:
     return d
 
 
+def _check_days(days: int) -> None:
+    if days < 1:
+        raise ValueError("days must be >= 1")
+
+
 def window_dates(start: date, days: int) -> list[date]:
+    _check_days(days)
     return [start + timedelta(days=i) for i in range(days)]
 
 
 def window_bounds_utc(start: date, days: int) -> tuple[datetime, datetime]:
     """Half-open [start of first ET day, start of day after the last) as UTC instants."""
+    _check_days(days)
     return _et_instant(start), _et_instant(start + timedelta(days=days))
 
 
