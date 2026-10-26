@@ -137,7 +137,10 @@ in-memory tables after writing them. Regression: `tests/test_postprocess_polars.
 (`validation.tx_metrics`, parquet metadata row counts); the churn and credit-default
 ML extracts keep label-defining columns (`customer_status`, `churn_date`,
 `account_status`, `closed_date`) out of the features, enforced by
-`ml_extracts.check_no_label_columns`. Tests: `tests/test_v7_polars_fixes.py`. Runtime ≈ 55 minutes for 50k customers.
+`ml_extracts.check_no_label_columns`. Credit-default `status_at_obs` / `paid_full_share_3m` are recomputed from
+payment allocations dated on or before the observation date (the final statement
+`payment_status` is settled with later cash); `max_source_date` includes payment
+dates. Tests: `tests/test_v7_asof_payments.py`. Tests: `tests/test_v7_polars_fixes.py`. Runtime ≈ 55 minutes for 50k customers.
 
 ---
 
