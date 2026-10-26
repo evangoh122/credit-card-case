@@ -1,11 +1,14 @@
+from datetime import datetime, time
+
 import numpy as np
 import polars as pl
 from faker import Faker
 from scipy.special import ndtr
 
+from ccc.geo import assign_city, city_zone
 from ccc.rng import entity_rng, unit_hash
 from ccc.sim.scenario import CohortShift
-from ccc.timeutil import sim_date
+from ccc.timeutil import local_to_utc, sim_date
 
 CHANNELS = ("organic", "referral", "paid", "partner")
 REGIONS = ("northeast", "south", "midwest", "west")
@@ -157,20 +160,31 @@ def identities(
 ) -> pl.DataFrame:
     fake = Faker(locale)
     names = []
+    cities = []
     for cid, _ in ids_join_day:
         fake.seed_instance(int(unit_hash(seed, "faker", cid) * 2**32))
         names.append(fake.name())
+        cities.append(assign_city(seed, cid))
+    zones = [city_zone(city) for city in cities]
+    joined = [
+        local_to_utc(datetime.combine(sim_date(start, j), time()), tz)
+        for (_, j), tz in zip(ids_join_day, zones, strict=True)
+    ]
     return pl.DataFrame(
         {
             "customer_id": [c for c, _ in ids_join_day],
             "name": names,
             "join_day": [j for _, j in ids_join_day],
-            "join_date": [sim_date(start, j) for _, j in ids_join_day],
+            "city": cities,
+            "tz": zones,
+            "joined_ts_utc": joined,
         },
         schema={
             "customer_id": pl.String,
             "name": pl.String,
             "join_day": pl.Int64,
-            "join_date": pl.Date,
+            "city": pl.String,
+            "tz": pl.String,
+            "joined_ts_utc": pl.Datetime("us", "UTC"),
         },
     )

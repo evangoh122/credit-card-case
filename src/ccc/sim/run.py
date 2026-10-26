@@ -4,8 +4,9 @@ from pathlib import Path
 
 import polars as pl
 
+from ccc.geo import ZONES
 from ccc.sim import events, overlay, profiles, scenario
-from ccc.timeutil import window_bounds_utc
+from ccc.timeutil import local_day_bounds_utc, sim_date
 
 SEED_TABLE_ROWS = 2000
 NO_SHIFT = scenario.CohortShift(0.0, 0.0)
@@ -51,10 +52,13 @@ def simulate(
 
     txns, evts = events.simulate_events(seed, sc, customers, days)
     if loaded_at is None:
-        loaded_at = window_bounds_utc(sc.start_date, days)[1]
+        last_local_date = sim_date(sc.start_date, days)
+        loaded_at = max(local_day_bounds_utc(last_local_date, tz)[0] for tz in ZONES)
 
     campaign_cols = [col for c in sc.campaigns for col in (f"{c.name}_arm", f"{c.name}_true_lift")]
-    dim = customers.select("customer_id", "name", "join_date", "channel", "region")
+    dim = customers.select(
+        "customer_id", "name", "city", "tz", "joined_ts_utc", "channel", "region"
+    )
     truth = customers.select(
         "customer_id",
         "cohort_day",

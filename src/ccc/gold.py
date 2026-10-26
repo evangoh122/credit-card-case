@@ -17,7 +17,7 @@ from ccc.segmentation import (
     hard_credit_rules,
     map_clusters_to_tiers,
 )
-from ccc.timeutil import snapshot_cutoff_utc
+from ccc.timeutil import local_date_expr, snapshot_cutoff_utc
 
 LOGGER = logging.getLogger(__name__)
 RFM_METRICS = ("recency", "frequency", "monetary")
@@ -35,6 +35,23 @@ def guard_no_truth_columns(frame: pl.DataFrame) -> None:
         raise ValueError(
             f"simulation truth columns must not be used in features or models: {leaked}"
         )
+
+
+def _zone_cutoffs(snapshot_date: date, zones: pl.Series) -> pl.DataFrame:
+    names = sorted(zones.unique().to_list())
+    return pl.DataFrame(
+        {
+            "tz": names,
+            "cutoff_utc": [snapshot_cutoff_utc(snapshot_date, tz) for tz in names],
+        },
+        schema={"tz": pl.String, "cutoff_utc": pl.Datetime("us", "UTC")},
+    )
+
+
+def _local_dates(frame: pl.DataFrame, dim_customer: pl.DataFrame) -> pl.DataFrame:
+    return frame.join(
+        dim_customer.select("customer_id", "tz"), on="customer_id", how="inner"
+    ).with_columns(local_date_expr("event_ts_utc", "tz").alias("event_local_date"))
 
 
 def _snapshot_date(value: date) -> date:
@@ -148,8 +165,8 @@ def rfm_snapshot(
     windows = _validate_windows(windows)
     guard_no_truth_columns(dim_customer)
     guard_no_truth_columns(fact_transactions)
-    required_dim = {"customer_id", "join_date"}
-    required_txn = {"customer_id", "txn_type", "amount", "event_date_et"}
+    required_dim = {"customer_id", "tz", "joined_ts_utc"}
+    required_txn = {"customer_id", "txn_type", "amount", "event_ts_utc"}
     if missing := required_dim.difference(dim_customer.columns):
         raise ValueError(f"dim_customer missing columns: {sorted(missing)}")
     if missing := required_txn.difference(fact_transactions.columns):
@@ -157,24 +174,32 @@ def rfm_snapshot(
     if dim_customer.get_column("customer_id").n_unique() != dim_customer.height:
         raise ValueError("dim_customer customer_id must be unique")
 
-    purchases = fact_transactions.filter(
-        (pl.col("txn_type") == "purchase") & (pl.col("event_date_et") <= snapshot_date)
+    dim = dim_customer.select("customer_id", "tz", "joined_ts_utc").with_columns(
+        local_date_expr("joined_ts_utc", "tz").alias("join_local_date")
+    )
+    purchases = _local_dates(fact_transactions.filter(pl.col("txn_type") == "purchase"), dim)
+    cutoffs = _zone_cutoffs(snapshot_date, purchases.get_column("tz"))
+    purchases = purchases.join(cutoffs, on="tz", how="left").filter(
+        (pl.col("event_local_date") <= snapshot_date)
+        & (pl.col("event_ts_utc") <= pl.col("cutoff_utc"))
     )
     result = (
-        dim_customer.filter(pl.col("join_date") <= snapshot_date)
-        .select("customer_id", "join_date")
+        dim.filter(pl.col("join_local_date") <= snapshot_date)
+        .select("customer_id", "join_local_date")
         .with_columns(
             pl.lit(snapshot_date).cast(pl.Date).alias("snapshot_date"),
-            (pl.lit(snapshot_date) - pl.col("join_date")).dt.total_days().alias("days_since_join"),
+            (pl.lit(snapshot_date) - pl.col("join_local_date"))
+            .dt.total_days()
+            .alias("days_since_join"),
         )
     )
     for metric in RFM_METRICS:
         # Recency is intentionally limited to its configured calendar-day window.
         start = snapshot_date - timedelta(days=windows[metric] - 1)
-        in_window = purchases.filter(pl.col("event_date_et") >= start)
+        in_window = purchases.filter(pl.col("event_local_date") >= start)
         if metric == "recency":
             aggregate = in_window.group_by("customer_id").agg(
-                (pl.lit(snapshot_date) - pl.col("event_date_et").max())
+                (pl.lit(snapshot_date) - pl.col("event_local_date").max())
                 .dt.total_days()
                 .alias(metric)
             )
@@ -188,19 +213,28 @@ def rfm_snapshot(
             pl.col("frequency").fill_null(0),
             pl.col("monetary").fill_null(0.0),
         )
-        .drop("join_date")
+        .drop("join_local_date")
         .sort("customer_id")
     )
     return score_rfm(result, bins) if bins is not None else result
 
 
-def engagement_features(fact_events: pl.DataFrame, snapshot_date: date) -> pl.DataFrame:
+def engagement_features(
+    fact_events: pl.DataFrame, dim_customer: pl.DataFrame, snapshot_date: date
+) -> pl.DataFrame:
     snapshot_date = _snapshot_date(snapshot_date)
     guard_no_truth_columns(fact_events)
-    required = {"customer_id", "event_type", "event_date_et"}
+    required = {"customer_id", "event_type", "event_ts_utc"}
     if missing := required.difference(fact_events.columns):
         raise ValueError(f"fact_events missing columns: {sorted(missing)}")
-    filtered = fact_events.filter(pl.col("event_date_et") <= snapshot_date)
+    if "tz" not in dim_customer.columns:
+        raise ValueError("dim_customer missing columns: ['tz']")
+    events = _local_dates(fact_events, dim_customer)
+    cutoffs = _zone_cutoffs(snapshot_date, events.get_column("tz"))
+    filtered = events.join(cutoffs, on="tz", how="left").filter(
+        (pl.col("event_local_date") <= snapshot_date)
+        & (pl.col("event_ts_utc") <= pl.col("cutoff_utc"))
+    )
     return (
         filtered.group_by("customer_id", maintain_order=True)
         .agg(
@@ -233,21 +267,30 @@ def segment_assignment_snapshot(
 
 
 def count_late_events(
-    events: pl.DataFrame, previous_snapshot_date: date, current_snapshot_date: date
+    events: pl.DataFrame,
+    dim_customer: pl.DataFrame,
+    previous_snapshot_date: date,
+    current_snapshot_date: date,
 ) -> int:
     previous_snapshot_date = _snapshot_date(previous_snapshot_date)
     current_snapshot_date = _snapshot_date(current_snapshot_date)
     if current_snapshot_date <= previous_snapshot_date:
         raise ValueError("current_snapshot_date must be after previous_snapshot_date")
-    required = {"event_date_et", "loaded_at"}
+    required = {"customer_id", "event_ts_utc", "loaded_at"}
     if missing := required.difference(events.columns):
         raise ValueError(f"events missing columns: {sorted(missing)}")
-    previous_cutoff = snapshot_cutoff_utc(previous_snapshot_date)
-    current_cutoff = snapshot_cutoff_utc(current_snapshot_date)
-    return events.filter(
-        (pl.col("event_date_et") <= previous_snapshot_date)
-        & (pl.col("loaded_at") > previous_cutoff)
-        & (pl.col("loaded_at") <= current_cutoff)
+    local = _local_dates(events, dim_customer)
+    previous = _zone_cutoffs(previous_snapshot_date, local.get_column("tz")).rename(
+        {"cutoff_utc": "previous_cutoff_utc"}
+    )
+    current = _zone_cutoffs(current_snapshot_date, local.get_column("tz")).rename(
+        {"cutoff_utc": "current_cutoff_utc"}
+    )
+    local = local.join(previous, on="tz", how="left").join(current, on="tz", how="left")
+    return local.filter(
+        (pl.col("event_local_date") <= previous_snapshot_date)
+        & (pl.col("loaded_at") > pl.col("previous_cutoff_utc"))
+        & (pl.col("loaded_at") <= pl.col("current_cutoff_utc"))
     ).height
 
 

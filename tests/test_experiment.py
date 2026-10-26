@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import UTC, date, datetime
 
 import numpy as np
 import polars as pl
@@ -264,16 +264,23 @@ def test_tenure_outcomes_enforces_window_and_maturity_boundaries() -> None:
     events = pl.DataFrame(
         {
             "customer_id": ["mature", "mature", "mature", "boundary", "immature"],
-            "event_date": [
-                date(2025, 12, 31),
-                date(2026, 1, 1) + timedelta(days=4),
-                date(2026, 1, 1) + timedelta(days=5),
-                date(2026, 1, 3) + timedelta(days=4),
-                date(2026, 1, 4),
+            "event_ts_utc": [
+                datetime(2025, 12, 31, 15, tzinfo=UTC),
+                datetime(2026, 1, 5, 15, tzinfo=UTC),
+                datetime(2026, 1, 6, 15, tzinfo=UTC),
+                datetime(2026, 1, 7, 15, tzinfo=UTC),
+                datetime(2026, 1, 4, 15, tzinfo=UTC),
             ],
+        },
+        schema_overrides={"event_ts_utc": pl.Datetime("us", "UTC")},
+    )
+    dim = pl.DataFrame(
+        {
+            "customer_id": ["mature", "boundary", "immature"],
+            "tz": ["America/New_York"] * 3,
         }
     )
-    result = tenure_outcomes(events, assignment, 5, as_of_date=date(2026, 1, 7))
+    result = tenure_outcomes(events, assignment, dim, 5, as_of_date=date(2026, 1, 7))
 
     by_customer = {row["customer_id"]: row for row in result.iter_rows(named=True)}
     assert by_customer["mature"]["event_count"] == 1

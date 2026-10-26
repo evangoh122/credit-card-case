@@ -15,6 +15,7 @@ from scipy.stats import norm
 
 from ccc import drift
 from ccc.sim import events, profiles, run, scenario
+from ccc.timeutil import local_datetime_expr
 
 LOGGER = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -78,8 +79,14 @@ def estimate_lift(
         source = tables["fact_transactions"].filter(pl.col("txn_type") == "purchase")
     else:
         source = tables["fact_events"].filter(pl.col("event_type") == campaign.event)
-    window = source.filter(
-        (pl.col("event_ts_utc") >= campaign.start_utc) & (pl.col("event_ts_utc") < campaign.end_utc)
+    zones = tables["dim_customer"].select("customer_id", "tz")
+    window = (
+        source.join(zones, on="customer_id", how="inner")
+        .with_columns(local_datetime_expr("event_ts_utc", "tz").alias("local_ts"))
+        .filter(
+            (pl.col("local_ts") >= campaign.start_local_dt)
+            & (pl.col("local_ts") < campaign.end_local_dt)
+        )
     )
     counts = window.group_by("customer_id").len()
     df = (

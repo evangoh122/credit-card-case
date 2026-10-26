@@ -17,7 +17,7 @@ def small_scenario():
         campaigns=(
             Campaign(
                 name="promo",
-                start_et="2026-10-21T09:00:00",
+                start_local="2026-10-21T09:00:00",
                 duration_days=6,
                 lift=0.4,
                 arrival_boost=0.5,
@@ -38,11 +38,11 @@ def recovery_scenario():
         campaigns=(
             Campaign(
                 name="real",
-                start_et="2026-10-20T09:00:00",
+                start_local="2026-10-20T09:00:00",
                 duration_days=10,
                 lift=0.5,
                 segment=Segment(risk_max=0.8),
             ),
-            Campaign(name="nothing", start_et="2026-10-20T09:00:00", duration_days=10, lift=0.0),
+            Campaign(name="nothing", start_local="2026-10-20T09:00:00", duration_days=10, lift=0.0),
         ),
     )

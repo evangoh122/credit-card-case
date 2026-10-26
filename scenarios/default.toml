@@ -6,7 +6,7 @@ arrivals_trend = 0.005
 
 [[campaigns]]
 name = "welcome_cashback"
-start_et = "2026-10-24T09:00:00"
+start_local = "2026-10-24T09:00:00"
 duration_days = 14
 lift = 0.35
 arrival_boost = 0.25
@@ -16,7 +16,7 @@ risk_max = 0.7
 
 [[campaigns]]
 name = "null_email"
-start_et = "2026-11-10T09:00:00"
+start_local = "2026-11-10T09:00:00"
 duration_days = 14
 lift = 0.0
 
