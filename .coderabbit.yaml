@@ -1,0 +1,23 @@
+language: en-US
+
+reviews:
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+    - path: "src/ccc/**"
+      instructions: |
+        Require all stored timestamps to be UTC. Reject fixed UTC offsets and 24-hour arithmetic.
+        Ensure sim_truth columns never reach features or frames.
+        Require seeded random number generation and reject calls to now().
+    - path: "tests/**"
+      instructions: |
+        Ensure tests can fail when behavior regresses and do not copy production logic.
+  path_filters:
+    - "!uv.lock"
+    - "!requirements.txt"
+  tools:
+    gitleaks:
+      enabled: true
+    ruff:
+      enabled: true
