@@ -3,6 +3,14 @@
 Credit card case: customer segmentation, randomized card-offer experiments and drift
 monitoring, tested on a seeded 60-day simulation. See `docs/design.md`.
 
+## How this was built
+
+- **Data:** all data is synthetic. It is produced with the help of AI and relevant libraries
+  (Faker, SDV and the seeded simulator in `ccc.sim`). No real customer data is used.
+  Additional synthetic customer data will be brought in as part of CI/CD.
+- **Front end:** built by AI.
+- **Analysis and MLOps:** done by a human.
+
 Python 3.12, managed with [uv](https://docs.astral.sh/uv/).
 
 ```
