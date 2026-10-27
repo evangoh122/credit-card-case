@@ -43,7 +43,7 @@ jobs:
           with open("/tmp/audit.json", encoding="utf-8") as report:
               dependencies = json.load(report)["dependencies"]
           findings = [
-              (dependency["name"], vulnerability["id"], vulnerability["fix_versions"])
+              (dependency["name"], vulnerability["id"], vulnerability.get("fix_versions", []))
               for dependency in dependencies
               for vulnerability in dependency.get("vulns", [])
           ]
