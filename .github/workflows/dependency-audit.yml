@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           python-version: "3.12"
@@ -40,13 +42,13 @@ jobs:
 
           with open("/tmp/audit.json", encoding="utf-8") as report:
               dependencies = json.load(report)["dependencies"]
-          fixable = [
+          findings = [
               (dependency["name"], vulnerability["id"], vulnerability["fix_versions"])
               for dependency in dependencies
               for vulnerability in dependency.get("vulns", [])
-              if vulnerability.get("fix_versions")
           ]
-          for package, vulnerability, fixes in fixable:
-              print(f"{package}: {vulnerability} (fix: {', '.join(fixes)})")
-          sys.exit(bool(fixable))
+          for package, vulnerability, fixes in findings:
+              fix_text = ", ".join(fixes) if fixes else "none available"
+              print(f"{package}: {vulnerability} (fix: {fix_text})")
+          sys.exit(any(fixes for _, _, fixes in findings))
           PY
