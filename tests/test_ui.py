@@ -79,6 +79,7 @@ def test_serve_stops_every_child_even_if_one_already_exited():
 
     with (
         mock.patch.object(subprocess, "Popen", side_effect=procs) as popen,
+        mock.patch.object(ui, "IS_WINDOWS", False),
         mock.patch.object(ui.os, "killpg", side_effect=killpg),
     ):
         assert ui.serve([["a"], ["b"]]) == 0
@@ -91,6 +92,7 @@ def test_serve_cleans_up_first_child_when_second_spawn_fails():
     first = _fake_proc(201)
     with (
         mock.patch.object(subprocess, "Popen", side_effect=[first, OSError("boom")]),
+        mock.patch.object(ui, "IS_WINDOWS", False),
         mock.patch.object(ui.os, "killpg") as killpg,
         pytest.raises(OSError),
     ):
@@ -102,9 +104,33 @@ def test_serve_cleans_up_first_child_when_second_spawn_fails():
 def test_stop_kills_group_when_child_ignores_sigterm():
     p = _fake_proc(301)
     p.wait.side_effect = [subprocess.TimeoutExpired("x", 1), None]
-    with mock.patch.object(ui.os, "killpg") as killpg:
+    with mock.patch.object(ui, "IS_WINDOWS", False), mock.patch.object(ui.os, "killpg") as killpg:
         ui._stop([p])
     assert [c.args for c in killpg.call_args_list] == [
         (301, signal.SIGTERM),
         (301, signal.SIGKILL),
     ]
+
+
+def test_stop_windows_never_uses_killpg_and_stops_every_child():
+    gone, live = _fake_proc(401), _fake_proc(402)
+    gone.terminate.side_effect = ProcessLookupError
+    live.wait.side_effect = [subprocess.TimeoutExpired("x", 1), None]
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(ui.os, "killpg", create=True) as killpg,
+    ):
+        ui._stop([gone, live])
+    killpg.assert_not_called()
+    live.terminate.assert_called_once()
+    live.kill.assert_called_once()
+    gone.kill.assert_called_once()
+
+
+def test_popen_kwargs_per_platform():
+    with mock.patch.object(ui, "IS_WINDOWS", False):
+        assert ui._popen_kwargs() == {"start_new_session": True}
+    with mock.patch.object(ui, "IS_WINDOWS", True):
+        kw = ui._popen_kwargs()
+    assert kw["creationflags"] == getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+    assert "start_new_session" not in kw

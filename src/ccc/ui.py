@@ -41,23 +41,36 @@ def evidently_command(workspace: str | Path, port: int) -> list[str]:
     ]  # fmt: skip
 
 
-def _signal_group(p: subprocess.Popen, sig: int) -> None:
+IS_WINDOWS = sys.platform == "win32"
+
+
+def _popen_kwargs() -> dict:
+    if IS_WINDOWS:
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)}
+    return {"start_new_session": True}
+
+
+def _signal_group(p: subprocess.Popen, force: bool) -> None:
+    """SIGTERM/SIGKILL the child's process group (Unix) or terminate/kill the child (Windows)."""
     try:
-        os.killpg(p.pid, sig)
+        if IS_WINDOWS:  # no killpg; terminate() == kill() there, but keep the two stages distinct
+            p.kill() if force else p.terminate()
+        else:
+            os.killpg(p.pid, signal.SIGKILL if force else signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         pass
 
 
 def _stop(procs: list[subprocess.Popen]) -> None:
-    """Terminate every child's process group, then kill whatever is left."""
+    """Terminate every child (and its process group on Unix), then kill whatever is left."""
     for p in procs:
-        _signal_group(p, signal.SIGTERM)
+        _signal_group(p, force=False)
     for p in procs:
         try:
             p.wait(timeout=STOP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             pass
-        _signal_group(p, signal.SIGKILL)
+        _signal_group(p, force=True)
         p.wait()
 
 
@@ -65,7 +78,7 @@ def serve(commands: list[list[str]]) -> int:
     procs: list[subprocess.Popen] = []
     try:
         for cmd in commands:
-            procs.append(subprocess.Popen(cmd, start_new_session=True))
+            procs.append(subprocess.Popen(cmd, **_popen_kwargs()))
         while all(p.poll() is None for p in procs):
             with contextlib.suppress(subprocess.TimeoutExpired):
                 procs[0].wait(timeout=1)
