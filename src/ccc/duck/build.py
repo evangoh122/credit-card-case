@@ -4,24 +4,28 @@ import argparse
 import json
 import os
 import shutil
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import duckdb
 
-from ccc.duck import DATABASES, _sql_string, connect
+from ccc.duck import DATABASES, _sql_string
 
 FACT_TABLES = ("fact_transactions", "fact_events")
-OUTPUT_FILES = tuple(f"{name}.duckdb" for name in (*DATABASES, "hub")) + ("connect.sql",)
+
+
+def _escape_glob_path(path: Path) -> str:
+    replacements = {"[": "[[]", "]": "[]]", "*": "[*]", "?": "[?]"}
+    return "".join(replacements.get(character, character) for character in str(path))
 
 
 def _parquet_source(root: Path, table: str) -> str:
     path = root / table
     if table in FACT_TABLES:
-        pattern = path / "*" / "*.parquet"
+        pattern = f"{_escape_glob_path(path)}/*/*.parquet"
     else:
-        pattern = root / f"{table}.parquet"
+        pattern = _escape_glob_path(root / f"{table}.parquet")
     return _sql_string(pattern)
 
 
@@ -34,9 +38,14 @@ def _read_manifest(parquet_dir: Path) -> dict:
         raise ValueError("Parquet export must use UTC timestamps")
     if manifest.get("data_label") != "synthetic":
         raise ValueError("Parquet export must be labelled synthetic")
+    required_counts = {"dim_customer", *FACT_TABLES}
+    if missing := required_counts.difference(manifest.get("row_counts", {})):
+        raise ValueError(f"manifest row_counts missing tables: {sorted(missing)}")
     if manifest.get("include_truth") or "sim_truth_customer" in manifest.get("row_counts", {}):
         raise ValueError("sim_truth_customer exports are refused")
-    if (parquet_dir / "sim_truth_customer.parquet").exists():
+    if (parquet_dir / "sim_truth_customer.parquet").exists() or (
+        parquet_dir / "sim_truth_customer"
+    ).exists():
         raise ValueError("sim_truth_customer must never be loaded")
     return manifest
 
@@ -70,9 +79,10 @@ def _build_facts(path: Path, parquet_dir: Path) -> None:
         _configure(con)
         for table in FACT_TABLES:
             source = _parquet_source(parquet_dir, table)
+            tie_breaker = "transaction_id" if table == "fact_transactions" else "event_id"
             con.execute(
                 f"CREATE TABLE {table} AS SELECT * FROM read_parquet('{source}') "
-                "ORDER BY event_ts_utc"
+                f"ORDER BY event_ts_utc, {tie_breaker}"
             )
 
 
@@ -90,10 +100,13 @@ def _build_gold(path: Path, dim_path: Path, facts_path: Path, snapshot_date: str
                 FROM dim.dim_customer
             ), purchases AS (
                 SELECT t.customer_id, t.amount,
-                       CAST(timezone(c.tz, t.event_ts_utc) AS DATE) AS event_date
+                       CAST(timezone(c.tz, t.event_ts_utc) AS DATE) AS event_date,
+                       t.event_ts_utc,
+                       timezone(c.tz, ($snapshot::DATE + INTERVAL 1 DAY)::TIMESTAMP)
+                           - INTERVAL 1 SECOND AS cutoff_utc
                 FROM facts.fact_transactions t
                 JOIN customers c USING (customer_id)
-                WHERE t.txn_type = 'purchase'
+                WHERE t.txn_type = 'purchase' AND t.event_ts_utc <= cutoff_utc
             ), metrics AS (
                 SELECT c.customer_id,
                        date_diff('day', max(p.event_date) FILTER (
@@ -124,6 +137,9 @@ def _build_gold(path: Path, dim_path: Path, facts_path: Path, snapshot_date: str
             FROM facts.fact_events e
             JOIN dim.dim_customer c USING (customer_id)
             WHERE CAST(timezone(c.tz, e.event_ts_utc) AS DATE) <= $snapshot::DATE
+              AND e.event_ts_utc <= timezone(
+                  c.tz, ($snapshot::DATE + INTERVAL 1 DAY)::TIMESTAMP
+              ) - INTERVAL 1 SECOND
             GROUP BY e.customer_id ORDER BY e.customer_id
             """,
             {"snapshot": snapshot_date},
@@ -157,23 +173,37 @@ def _write_connect_sql(path: Path) -> None:
     )
 
 
-def check_integrity(out_dir: str | Path) -> None:
-    """Reject null or orphan customer IDs in every fact-like warehouse table."""
-    with connect(out_dir) as con:
-        tables = [
+def _check_integrity_dir(root: Path, expected_counts: dict[str, int] | None = None) -> None:
+    with duckdb.connect(str(root / "hub.duckdb"), read_only=True) as con:
+        _configure(con)
+        for alias in DATABASES:
+            con.execute(f"ATTACH '{_sql_string(root / f'{alias}.duckdb')}' AS {alias} (READ_ONLY)")
+        tables = (
+            ("dim", "dim_customer"),
             ("facts", "fact_transactions"),
             ("facts", "fact_events"),
             ("gold", "fact_rfm_snapshot"),
             ("gold", "fact_engagement_snapshot"),
-        ]
+        )
         for database, table in tables:
+            count = con.execute(f"SELECT count(*) FROM {database}.{table}").fetchone()[0]
+            if not count:
+                raise ValueError(f"{database}.{table} must not be empty")
+            if expected_counts is not None and table in expected_counts:
+                expected = expected_counts[table]
+                if count != expected:
+                    raise ValueError(
+                        f"{table} row count {count} does not match manifest {expected}"
+                    )
             nulls = con.execute(
                 f"SELECT count(*) FROM {database}.{table} WHERE customer_id IS NULL"
             ).fetchone()[0]
-            orphans = con.execute(
-                f"SELECT count(*) FROM (SELECT customer_id FROM {database}.{table} "
-                "EXCEPT SELECT customer_id FROM dim.dim_customer)"
-            ).fetchone()[0]
+            orphans = 0
+            if database != "dim":
+                orphans = con.execute(
+                    f"SELECT count(*) FROM (SELECT customer_id FROM {database}.{table} "
+                    "EXCEPT SELECT customer_id FROM dim.dim_customer)"
+                ).fetchone()[0]
             if nulls or orphans:
                 raise ValueError(
                     f"{database}.{table} failed customer integrity: "
@@ -181,12 +211,23 @@ def check_integrity(out_dir: str | Path) -> None:
                 )
 
 
+def check_integrity(out_dir: str | Path) -> None:
+    """Reject empty tables and null or orphan customer IDs in the current build."""
+    root = (Path(out_dir).expanduser().resolve() / "current").resolve(strict=True)
+    _check_integrity_dir(root)
+
+
 def build(parquet_dir: str | Path, out_dir: str | Path) -> None:
     parquet_root = Path(parquet_dir).expanduser().resolve()
     output_root = Path(out_dir).expanduser().resolve()
     manifest = _read_manifest(parquet_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=".ccc-duckdb-", dir=output_root))
+    for abandoned in output_root.glob(".stage-*"):
+        if abandoned.is_dir():
+            shutil.rmtree(abandoned)
+    build_id = f"build-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}-{uuid4().hex[:8]}"
+    stage = output_root / f".stage-{build_id}"
+    stage.mkdir()
     try:
         dim_path = stage / "dim.duckdb"
         facts_path = stage / "facts.duckdb"
@@ -199,9 +240,17 @@ def build(parquet_dir: str | Path, out_dir: str | Path) -> None:
         _build_gold(gold_path, dim_path, facts_path, dates[1])
         _build_hub(stage / "hub.duckdb", datetime.now(UTC))
         _write_connect_sql(stage / "connect.sql")
-        check_integrity(stage)
-        for file_name in OUTPUT_FILES:
-            os.replace(stage / file_name, output_root / file_name)
+        _check_integrity_dir(stage, manifest.get("row_counts", {}))
+        for wal in stage.rglob("*.wal"):
+            wal.unlink()
+        final = output_root / build_id
+        os.replace(stage, final)
+        pending_link = output_root / f".current-{uuid4().hex}"
+        try:
+            pending_link.symlink_to(build_id, target_is_directory=True)
+            os.replace(pending_link, output_root / "current")
+        finally:
+            pending_link.unlink(missing_ok=True)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
