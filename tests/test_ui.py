@@ -61,12 +61,16 @@ def test_main_rejects_same_port():
         ui.main(["--port", "7000", "--evidently-port", "7000"])
 
 
+unix_only = pytest.mark.skipif(sys.platform == "win32", reason="process groups are Unix-only")
+
+
 def _fake_proc(pid):
     p = mock.Mock(pid=pid, returncode=0)
     p.poll.return_value = None
     return p
 
 
+@unix_only
 def test_serve_stops_every_child_even_if_one_already_exited():
     procs = [_fake_proc(101), _fake_proc(102)]
     procs[0].wait.side_effect = [KeyboardInterrupt, None, None]
@@ -88,6 +92,7 @@ def test_serve_stops_every_child_even_if_one_already_exited():
     procs[1].wait.assert_called()
 
 
+@unix_only
 def test_serve_cleans_up_first_child_when_second_spawn_fails():
     first = _fake_proc(201)
     with (
@@ -101,6 +106,7 @@ def test_serve_cleans_up_first_child_when_second_spawn_fails():
     first.wait.assert_called()
 
 
+@unix_only
 def test_stop_kills_group_when_child_ignores_sigterm():
     p = _fake_proc(301)
     p.wait.side_effect = [subprocess.TimeoutExpired("x", 1), None]
@@ -112,19 +118,37 @@ def test_stop_kills_group_when_child_ignores_sigterm():
     ]
 
 
-def test_stop_windows_never_uses_killpg_and_stops_every_child():
+def test_stop_windows_uses_taskkill_tree_and_stops_every_child():
     gone, live = _fake_proc(401), _fake_proc(402)
-    gone.terminate.side_effect = ProcessLookupError
     live.wait.side_effect = [subprocess.TimeoutExpired("x", 1), None]
     with (
         mock.patch.object(ui, "IS_WINDOWS", True),
         mock.patch.object(ui.os, "killpg", create=True) as killpg,
+        mock.patch.object(subprocess, "run") as run,
     ):
         ui._stop([gone, live])
     killpg.assert_not_called()
-    live.terminate.assert_called_once()
-    live.kill.assert_called_once()
-    gone.kill.assert_called_once()
+    cmds = [c.args[0] for c in run.call_args_list]
+    assert cmds == [
+        ["taskkill", "/PID", "401", "/T"],
+        ["taskkill", "/PID", "402", "/T"],
+        ["taskkill", "/PID", "401", "/F", "/T"],
+        ["taskkill", "/PID", "402", "/F", "/T"],
+    ]
+    assert all(c.kwargs["check"] is False for c in run.call_args_list)
+
+
+def test_stop_windows_falls_back_when_taskkill_missing():
+    p = _fake_proc(501)
+    p.terminate.side_effect = ProcessLookupError  # also tolerate exited child? OSError subclass
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(subprocess, "run", side_effect=FileNotFoundError),
+    ):
+        ui._stop([p])
+    p.terminate.assert_called_once()
+    p.kill.assert_called_once()
+    p.wait.assert_called()
 
 
 def test_popen_kwargs_per_platform():

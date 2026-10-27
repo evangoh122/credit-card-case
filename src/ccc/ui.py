@@ -50,11 +50,20 @@ def _popen_kwargs() -> dict:
     return {"start_new_session": True}
 
 
+def _taskkill_tree(p: subprocess.Popen, force: bool) -> None:
+    cmd = ["taskkill", "/PID", str(p.pid), *(["/F"] if force else []), "/T"]
+    try:
+        subprocess.run(cmd, check=False, capture_output=True)
+    except OSError:  # taskkill missing: fall back to the direct child only
+        with contextlib.suppress(OSError):
+            p.kill() if force else p.terminate()
+
+
 def _signal_group(p: subprocess.Popen, force: bool) -> None:
     """SIGTERM/SIGKILL the child's process group (Unix) or terminate/kill the child (Windows)."""
     try:
-        if IS_WINDOWS:  # no killpg; terminate() == kill() there, but keep the two stages distinct
-            p.kill() if force else p.terminate()
+        if IS_WINDOWS:  # no killpg: taskkill /T walks the whole process tree
+            _taskkill_tree(p, force)
         else:
             os.killpg(p.pid, signal.SIGKILL if force else signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
