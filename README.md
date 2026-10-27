@@ -25,7 +25,7 @@ uv run ruff check . && uv run ruff format --check .
 - Build connected DuckDB files with `python -m ccc.duck.build --parquet-dir DIR --out-dir DIR`.
   After `from ccc.duck import connect`, `with connect(DIR) as con:` attaches `dim`, `facts`, and `gold`, so
   `con.sql("SELECT * FROM facts.fact_transactions JOIN dim.dim_customer USING (customer_id)")`
-  works across files; DuckDB CLI/UI users can run the generated `current/connect.sql`.
+  works across files; from the output directory, DuckDB CLI/UI users can run `current/connect.sql`.
 - `ccc.tracking`, `python -m ccc.run_study`: logs a seeded study to MLflow (parent run per study,
   child per seed) and checks planted campaign effects are recovered across seeds. Run
   `uv run python -m ccc.run_study --scenario scenarios/default.toml --seeds 1 2 3 --n-initial 300`;
