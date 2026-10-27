@@ -200,6 +200,7 @@ class _Child:
         self.pid, self._polls, self.forced = pid, list(polls), forced
         self.signalled = False
         self.returncode = None
+        self.on_signal = None  # side effect run when this child is signalled
 
     def poll(self):
         code = self.forced if self.signalled else self._polls[0]
@@ -225,6 +226,8 @@ def _serve_windows(children, interrupt=True):
         child = next(c for c in children if str(c.pid) == cmd[2])
         child.signalled = True
         killed.append(child.pid)
+        if child.on_signal:
+            child.on_signal()
         return _run_result(0)
 
     first_wait = children[0].wait
@@ -255,9 +258,11 @@ def test_serve_child_that_crashed_before_shutdown_keeps_its_code():
 
 
 def test_serve_child_exiting_between_poll_and_signal_keeps_its_code():
-    # alive at the loop check, exits with 3 before _stop signals it
-    racer, other = _Child(821, [None, 3]), _Child(822, [None], forced=1)
-    assert _serve_windows([racer, other]) == 3
+    # B dies on its own (code 3) only as a side effect of A being signalled: after any global
+    # pre-stop snapshot, but before B itself is signalled. Needs per-child poll-then-signal.
+    a, b = _Child(821, [None], forced=1), _Child(822, [None], forced=1)
+    a.on_signal = lambda: setattr(b, "_polls", [3])
+    assert _serve_windows([a, b]) == 3
 
 
 def test_popen_kwargs_per_platform():
