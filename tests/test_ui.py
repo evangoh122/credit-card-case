@@ -65,7 +65,7 @@ unix_only = pytest.mark.skipif(sys.platform == "win32", reason="process groups a
 
 
 def _fake_proc(pid):
-    p = mock.Mock(pid=pid, returncode=0)
+    p = mock.Mock(pid=pid, returncode=None)
     p.poll.return_value = None
     return p
 
@@ -151,8 +151,23 @@ def test_stop_windows_taskkill_fails_child_alive_kills_and_reports_without_hangi
         ui._stop([stuck, other])  # must return, not raise
     stuck.kill.assert_called_once()
     stuck.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
-    assert "601" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "taskkill failed for child pid 601: exit code 1" in err
+    assert "failed to stop child pid 601" in err
     other.wait.assert_called_once()  # other children are still stopped
+
+
+def test_stop_windows_taskkill_failure_reported_even_when_kill_succeeds(capsys):
+    p = _fake_proc(651)
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(subprocess, "run", return_value=_run_result(5)),
+    ):
+        ui._stop([p])  # kill works, wait returns normally
+    p.kill.assert_called_once()
+    err = capsys.readouterr().err
+    assert "taskkill failed for child pid 651: exit code 5" in err
+    assert "failed to stop" not in err
 
 
 def test_stop_windows_taskkill_fails_but_child_already_exited_is_fine(capsys):
@@ -178,32 +193,71 @@ def test_stop_windows_falls_back_when_taskkill_missing():
     p.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
 
 
-def _serve_with(procs, interrupt):
-    if interrupt:
-        procs[0].wait.side_effect = [KeyboardInterrupt] + [None] * 5
+class _Child:
+    """Fake Popen: poll() walks `polls`; once signalled it exits with `forced`."""
+
+    def __init__(self, pid, polls, forced=1):
+        self.pid, self._polls, self.forced = pid, list(polls), forced
+        self.signalled = False
+        self.returncode = None
+
+    def poll(self):
+        code = self.forced if self.signalled else self._polls[0]
+        if len(self._polls) > 1 and not self.signalled:
+            self._polls.pop(0)
+        self.returncode = code
+        return code
+
+    def wait(self, timeout=None):
+        if self.poll() is None:
+            raise subprocess.TimeoutExpired("x", timeout)
+
+    def kill(self):
+        self.signalled = True
+
+    terminate = kill
+
+
+def _serve_windows(children, interrupt=True):
+    killed = []
+
+    def taskkill(cmd, **kw):
+        child = next(c for c in children if str(c.pid) == cmd[2])
+        child.signalled = True
+        killed.append(child.pid)
+        return _run_result(0)
+
+    first_wait = children[0].wait
+
+    def wait(timeout=None):
+        if interrupt and not killed and not getattr(wait, "raised", False):
+            wait.raised = True
+            raise KeyboardInterrupt
+        first_wait(timeout)
+
+    children[0].wait = wait
     with (
-        mock.patch.object(subprocess, "Popen", side_effect=procs),
+        mock.patch.object(subprocess, "Popen", side_effect=children),
         mock.patch.object(ui, "IS_WINDOWS", True),
-        mock.patch.object(subprocess, "run", return_value=_run_result(0)),
-        mock.patch.object(ui, "_stop") as stop,
+        mock.patch.object(subprocess, "run", side_effect=taskkill),
     ):
-        stop.side_effect = lambda ps: (
-            [setattr(p, "returncode", 1) for p in ps]
-            and [setattr(p, "poll", mock.Mock(return_value=1)) for p in ps]
-        )
         return ui.serve([["a"], ["b"]])
 
 
 def test_serve_ctrl_c_with_forced_stop_codes_returns_zero():
-    procs = [_fake_proc(801), _fake_proc(802)]  # alive at Ctrl-C; _stop forces nonzero codes
-    assert _serve_with(procs, interrupt=True) == 0
+    children = [_Child(801, [None], forced=1), _Child(802, [None], forced=1)]
+    assert _serve_windows(children) == 0
 
 
 def test_serve_child_that_crashed_before_shutdown_keeps_its_code():
-    crashed, other = _fake_proc(811), _fake_proc(812)
-    crashed.poll.return_value = 3
-    crashed.returncode = 3
-    assert _serve_with([crashed, other], interrupt=False) == 3
+    crashed, other = _Child(811, [3]), _Child(812, [None], forced=1)
+    assert _serve_windows([crashed, other], interrupt=False) == 3
+
+
+def test_serve_child_exiting_between_poll_and_signal_keeps_its_code():
+    # alive at the loop check, exits with 3 before _stop signals it
+    racer, other = _Child(821, [None, 3]), _Child(822, [None], forced=1)
+    assert _serve_windows([racer, other]) == 3
 
 
 def test_popen_kwargs_per_platform():

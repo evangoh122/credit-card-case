@@ -56,10 +56,13 @@ def _taskkill_tree(p: subprocess.Popen) -> None:
         result = subprocess.run(
             ["taskkill", "/PID", str(p.pid), "/F", "/T"], check=False, capture_output=True
         )
-        failed = result.returncode != 0
-    except OSError:  # taskkill missing
-        failed = True
+        failed, detail = result.returncode != 0, f"exit code {result.returncode}"
+    except OSError as exc:  # taskkill missing
+        failed, detail = True, f"unavailable ({exc})"
     if failed and p.poll() is None:  # nonzero while the child is already gone is fine
+        print(
+            f"taskkill failed for child pid {p.pid}: {detail}; killing it directly", file=sys.stderr
+        )
         with contextlib.suppress(OSError):
             p.kill()
 
@@ -78,27 +81,31 @@ def _wait_or_report(p: subprocess.Popen) -> None:
         print(f"failed to stop child pid {p.pid}; it may still be running", file=sys.stderr)
 
 
-def _stop(procs: list[subprocess.Popen]) -> None:
+def _stop(procs: list[subprocess.Popen]) -> list[int | None]:
     """Stop every child. Windows: force the whole tree at once (a graceful taskkill does nothing
-    for console processes). Unix: SIGTERM the group, wait, then SIGKILL what is left."""
+    for console processes). Unix: SIGTERM the group, wait, then SIGKILL what is left.
+
+    Returns each child's return code as observed immediately before we first signalled it, so
+    a child that died on its own keeps its real code and one we killed reads None.
+    """
+    seen: list[int | None] = []
+    for p in procs:
+        seen.append(p.poll())  # before any signal: our own kills must not look like crashes
+        _taskkill_tree(p) if IS_WINDOWS else _signal_group(p, force=False)
     if IS_WINDOWS:
         for p in procs:
-            _taskkill_tree(p)
-        for p in procs:
             _wait_or_report(p)
-        return
-    for p in procs:
-        _signal_group(p, force=False)
+        return seen
     for p in procs:
         with contextlib.suppress(subprocess.TimeoutExpired):
             p.wait(timeout=STOP_TIMEOUT_S)
         _signal_group(p, force=True)
         _wait_or_report(p)
+    return seen
 
 
 def serve(commands: list[list[str]]) -> int:
     procs: list[subprocess.Popen] = []
-    codes: list[int | None] = []
     try:
         for cmd in commands:
             procs.append(subprocess.Popen(cmd, **_popen_kwargs()))
@@ -108,8 +115,7 @@ def serve(commands: list[list[str]]) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        codes = [p.poll() for p in procs]  # before _stop: forced-stop codes are not failures
-        _stop(procs)
+        codes = _stop(procs)  # forced-stop codes are never counted
     return next((c for c in codes if c not in (0, None, -15)), 0)
 
 
