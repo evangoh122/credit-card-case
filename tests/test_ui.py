@@ -118,37 +118,92 @@ def test_stop_kills_group_when_child_ignores_sigterm():
     ]
 
 
-def test_stop_windows_uses_taskkill_tree_and_stops_every_child():
+def _run_result(returncode):
+    return mock.Mock(returncode=returncode)
+
+
+def test_stop_windows_forces_tree_first_and_stops_every_child():
     gone, live = _fake_proc(401), _fake_proc(402)
-    live.wait.side_effect = [subprocess.TimeoutExpired("x", 1), None]
     with (
         mock.patch.object(ui, "IS_WINDOWS", True),
         mock.patch.object(ui.os, "killpg", create=True) as killpg,
-        mock.patch.object(subprocess, "run") as run,
+        mock.patch.object(subprocess, "run", return_value=_run_result(0)) as run,
     ):
         ui._stop([gone, live])
     killpg.assert_not_called()
     cmds = [c.args[0] for c in run.call_args_list]
     assert cmds == [
-        ["taskkill", "/PID", "401", "/T"],
-        ["taskkill", "/PID", "402", "/T"],
         ["taskkill", "/PID", "401", "/F", "/T"],
         ["taskkill", "/PID", "402", "/F", "/T"],
     ]
     assert all(c.kwargs["check"] is False for c in run.call_args_list)
+    gone.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
+    live.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
+
+
+def test_stop_windows_taskkill_fails_child_alive_kills_and_reports_without_hanging(capsys):
+    stuck, other = _fake_proc(601), _fake_proc(602)
+    stuck.wait.side_effect = subprocess.TimeoutExpired("x", 1)  # never exits
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(subprocess, "run", return_value=_run_result(1)),
+    ):
+        ui._stop([stuck, other])  # must return, not raise
+    stuck.kill.assert_called_once()
+    stuck.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
+    assert "601" in capsys.readouterr().err
+    other.wait.assert_called_once()  # other children are still stopped
+
+
+def test_stop_windows_taskkill_fails_but_child_already_exited_is_fine(capsys):
+    p = _fake_proc(701)
+    p.poll.return_value = 1
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(subprocess, "run", return_value=_run_result(128)),
+    ):
+        ui._stop([p])
+    p.kill.assert_not_called()
+    assert capsys.readouterr().err == ""
 
 
 def test_stop_windows_falls_back_when_taskkill_missing():
     p = _fake_proc(501)
-    p.terminate.side_effect = ProcessLookupError  # also tolerate exited child? OSError subclass
     with (
         mock.patch.object(ui, "IS_WINDOWS", True),
         mock.patch.object(subprocess, "run", side_effect=FileNotFoundError),
     ):
         ui._stop([p])
-    p.terminate.assert_called_once()
     p.kill.assert_called_once()
-    p.wait.assert_called()
+    p.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
+
+
+def _serve_with(procs, interrupt):
+    if interrupt:
+        procs[0].wait.side_effect = [KeyboardInterrupt] + [None] * 5
+    with (
+        mock.patch.object(subprocess, "Popen", side_effect=procs),
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(subprocess, "run", return_value=_run_result(0)),
+        mock.patch.object(ui, "_stop") as stop,
+    ):
+        stop.side_effect = lambda ps: (
+            [setattr(p, "returncode", 1) for p in ps]
+            and [setattr(p, "poll", mock.Mock(return_value=1)) for p in ps]
+        )
+        return ui.serve([["a"], ["b"]])
+
+
+def test_serve_ctrl_c_with_forced_stop_codes_returns_zero():
+    procs = [_fake_proc(801), _fake_proc(802)]  # alive at Ctrl-C; _stop forces nonzero codes
+    assert _serve_with(procs, interrupt=True) == 0
+
+
+def test_serve_child_that_crashed_before_shutdown_keeps_its_code():
+    crashed, other = _fake_proc(811), _fake_proc(812)
+    crashed.poll.return_value = 3
+    crashed.returncode = 3
+    assert _serve_with([crashed, other], interrupt=False) == 3
 
 
 def test_popen_kwargs_per_platform():

@@ -50,41 +50,55 @@ def _popen_kwargs() -> dict:
     return {"start_new_session": True}
 
 
-def _taskkill_tree(p: subprocess.Popen, force: bool) -> None:
-    cmd = ["taskkill", "/PID", str(p.pid), *(["/F"] if force else []), "/T"]
+def _taskkill_tree(p: subprocess.Popen) -> None:
+    """Force-kill the child's whole process tree; fall back to the direct child on failure."""
     try:
-        subprocess.run(cmd, check=False, capture_output=True)
-    except OSError:  # taskkill missing: fall back to the direct child only
+        result = subprocess.run(
+            ["taskkill", "/PID", str(p.pid), "/F", "/T"], check=False, capture_output=True
+        )
+        failed = result.returncode != 0
+    except OSError:  # taskkill missing
+        failed = True
+    if failed and p.poll() is None:  # nonzero while the child is already gone is fine
         with contextlib.suppress(OSError):
-            p.kill() if force else p.terminate()
+            p.kill()
 
 
 def _signal_group(p: subprocess.Popen, force: bool) -> None:
-    """SIGTERM/SIGKILL the child's process group (Unix) or terminate/kill the child (Windows)."""
+    """SIGTERM/SIGKILL the child's process group (Unix only)."""
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(p.pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
+def _wait_or_report(p: subprocess.Popen) -> None:
+    """Bounded final wait; a child that outlives it is reported, never raised or waited on."""
     try:
-        if IS_WINDOWS:  # no killpg: taskkill /T walks the whole process tree
-            _taskkill_tree(p, force)
-        else:
-            os.killpg(p.pid, signal.SIGKILL if force else signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
+        p.wait(timeout=STOP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        print(f"failed to stop child pid {p.pid}; it may still be running", file=sys.stderr)
 
 
 def _stop(procs: list[subprocess.Popen]) -> None:
-    """Terminate every child (and its process group on Unix), then kill whatever is left."""
+    """Stop every child. Windows: force the whole tree at once (a graceful taskkill does nothing
+    for console processes). Unix: SIGTERM the group, wait, then SIGKILL what is left."""
+    if IS_WINDOWS:
+        for p in procs:
+            _taskkill_tree(p)
+        for p in procs:
+            _wait_or_report(p)
+        return
     for p in procs:
         _signal_group(p, force=False)
     for p in procs:
-        try:
+        with contextlib.suppress(subprocess.TimeoutExpired):
             p.wait(timeout=STOP_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            pass
         _signal_group(p, force=True)
-        p.wait()
+        _wait_or_report(p)
 
 
 def serve(commands: list[list[str]]) -> int:
     procs: list[subprocess.Popen] = []
+    codes: list[int | None] = []
     try:
         for cmd in commands:
             procs.append(subprocess.Popen(cmd, **_popen_kwargs()))
@@ -94,8 +108,9 @@ def serve(commands: list[list[str]]) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        codes = [p.poll() for p in procs]  # before _stop: forced-stop codes are not failures
         _stop(procs)
-    return next((p.returncode for p in procs if p.returncode not in (0, None, -15)), 0)
+    return next((c for c in codes if c not in (0, None, -15)), 0)
 
 
 def main(argv: list[str] | None = None) -> int:
