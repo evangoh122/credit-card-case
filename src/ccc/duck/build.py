@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import time
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ import duckdb
 from ccc.duck import DATABASES, _sql_string
 
 FACT_TABLES = ("fact_transactions", "fact_events")
+_PUBLISHED_BUILD_NAME = re.compile(r"build-\d{8}T\d{12}Z-[0-9a-f]{8}\Z")
 
 
 def _escape_glob_path(path: Path) -> str:
@@ -283,12 +285,93 @@ def build(
         shutil.rmtree(stage, ignore_errors=True)
 
 
+def _published_builds(root: Path) -> list[Path]:
+    builds = []
+    for path in root.glob("build-*"):
+        if path.is_symlink() or not path.is_dir():
+            continue
+        if _PUBLISHED_BUILD_NAME.fullmatch(path.name) is None:
+            continue
+        builds.append(path)
+    return sorted(builds, key=lambda path: path.name)
+
+
+def prune_builds(
+    out_dir: str | Path,
+    *,
+    keep_last: int = 1,
+    acknowledge_readers_stopped: bool = False,
+) -> list[Path]:
+    """Explicitly delete older published ``build-*`` directories.
+
+    Ordinary :func:`build` never calls this function: a reader may still have an
+    older build open even after ``current`` moves on. Only run it after stopping
+    every consumer of candidate builds and passing
+    ``acknowledge_readers_stopped=True``. The ``current`` target, ``.stage-*``
+    directories, symlinks, malformed ``build-*`` names and unrelated files are
+    preserved. This cannot detect open file handles itself, so the operator
+    acknowledgement is a required precondition, not a safety check.
+    """
+    if acknowledge_readers_stopped is not True:
+        raise ValueError(
+            "pruning requires acknowledge_readers_stopped=True after stopping all readers"
+        )
+    if isinstance(keep_last, bool) or not isinstance(keep_last, int) or keep_last < 1:
+        raise ValueError("keep_last must be a positive integer")
+    root = Path(out_dir).expanduser().resolve()
+    current = root / "current"
+    if not current.is_symlink():
+        raise ValueError(f"warehouse current must be a symlink before pruning: {current}")
+    try:
+        current_target = current.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError(f"warehouse current target is missing: {current}") from exc
+    if current_target.parent != root:
+        raise ValueError("warehouse current must point at a build inside the output root")
+    builds = _published_builds(root)
+    protected = set(builds[-keep_last:]) | {current_target}
+    removed = []
+    for path in builds:
+        if path in protected:
+            continue
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="python -m ccc.duck.build")
-    parser.add_argument("--parquet-dir", required=True, type=Path)
+    parser.add_argument("--parquet-dir", type=Path)
     parser.add_argument("--out-dir", type=Path, default=Path("~/data/ccc-duckdb"))
     parser.add_argument("--snapshot-date", help="customer-local gold snapshot date (YYYY-MM-DD)")
+    parser.add_argument(
+        "--prune-builds",
+        action="store_true",
+        help="delete older published builds after an explicit reader-stop acknowledgement",
+    )
+    parser.add_argument(
+        "--keep-last",
+        type=int,
+        default=1,
+        help="number of most recent published builds to keep when pruning",
+    )
+    parser.add_argument(
+        "--acknowledge-readers-stopped",
+        action="store_true",
+        help="assert every consumer of candidate older builds has stopped",
+    )
     args = parser.parse_args(argv)
+    if args.prune_builds:
+        removed = prune_builds(
+            args.out_dir,
+            keep_last=args.keep_last,
+            acknowledge_readers_stopped=args.acknowledge_readers_stopped,
+        )
+        for path in removed:
+            print(f"removed {path}")
+        return
+    if args.parquet_dir is None:
+        parser.error("--parquet-dir is required unless --prune-builds is used")
     build(args.parquet_dir, args.out_dir, snapshot_date=args.snapshot_date)
 
 

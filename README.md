@@ -26,6 +26,12 @@ uv run ruff check . && uv run ruff format --check .
   After `from ccc.duck import connect`, `with connect(DIR) as con:` attaches `dim`, `facts`, and `gold`, so
   `con.sql("SELECT * FROM facts.fact_transactions JOIN dim.dim_customer USING (customer_id)")`
   works across files; from the output directory, DuckDB CLI/UI users can run `current/connect.sql`.
+- Every build publishes an immutable `build-*` directory and atomically moves the `current` symlink;
+  normal builds never delete old builds, because an existing reader may still have one open. To reclaim
+  space, stop every consumer that may use candidate builds and run the explicit maintenance command
+  `python -m ccc.duck.build --out-dir DIR --prune-builds --keep-last 2 --acknowledge-readers-stopped`.
+  Pruning refuses without that acknowledgement and preserves the `current` target, `.stage-*` directories,
+  symlinks, malformed `build-*` names and unrelated files. It cannot detect open file handles itself.
 - `ccc.tracking`, `python -m ccc.run_study`: logs a seeded study to MLflow (parent run per study,
   child per seed) and checks planted campaign effects are recovered across seeds. Run
   `uv run python -m ccc.run_study --scenario scenarios/default.toml --seeds 1 2 3 --n-initial 300`;

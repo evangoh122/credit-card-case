@@ -2,7 +2,8 @@ import importlib
 import json
 import os
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as wall_time
 from pathlib import Path
 
 import duckdb
@@ -10,7 +11,11 @@ import polars as pl
 import pytest
 
 from ccc.duck import connect
-from ccc.duck.build import build, check_integrity
+from ccc.duck.build import build, check_integrity, main, prune_builds
+from ccc.gold import engagement_features, rfm_snapshot
+from ccc.timeutil import local_to_utc, snapshot_cutoff_utc
+
+GOLD_WINDOWS = {"recency": 30, "frequency": 90, "monetary": 90}
 
 
 def _write_export(root: Path) -> None:
@@ -101,6 +106,96 @@ def _current(out: Path) -> Path:
     return (out / "current").resolve(strict=True)
 
 
+def _write_boundary_export(root: Path, snapshot: date) -> None:
+    root.mkdir()
+    zones = {"la": "America/Los_Angeles", "ny": "America/New_York"}
+    dim_customers, tz_names, txn_ids, txn_customers, txn_times, txn_amounts = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
+    event_ids, event_customers, event_types, event_times = [], [], [], []
+    for customer_id, tz in zones.items():
+        dim_customers.append(customer_id)
+        tz_names.append(tz)
+        just_before = local_to_utc(datetime.combine(snapshot, wall_time(23, 59, 59, 500000)), tz)
+        at_midnight = snapshot_cutoff_utc(snapshot, tz)
+        after_midnight = at_midnight + timedelta(microseconds=500000)
+        for index, (instant, amount) in enumerate(
+            ((just_before, 10.0), (at_midnight, 11.0), (after_midnight, 12.0))
+        ):
+            txn_ids.append(f"{customer_id}-txn-{index}")
+            txn_customers.append(customer_id)
+            txn_times.append(instant)
+            txn_amounts.append(amount)
+            event_ids.append(f"{customer_id}-open-{index}")
+            event_customers.append(customer_id)
+            event_types.append("app_open")
+            event_times.append(instant)
+        older = local_to_utc(datetime.combine(snapshot - timedelta(days=3), wall_time(12)), tz)
+        event_ids.extend([f"{customer_id}-open-old", f"{customer_id}-repay"])
+        event_customers.extend([customer_id, customer_id])
+        event_types.extend(["app_open", "repayment"])
+        event_times.extend([older, older])
+    dim = pl.DataFrame(
+        {
+            "customer_id": dim_customers,
+            "city": ["Los Angeles", "New York"],
+            "tz": tz_names,
+            "joined_ts_utc": [datetime(2025, 12, 1, 12, tzinfo=UTC)] * 2,
+            "loaded_at": [datetime(2026, 12, 1, tzinfo=UTC)] * 2,
+        }
+    )
+    dim.write_parquet(root / "dim_customer.parquet")
+    tables = {
+        "fact_transactions": pl.DataFrame(
+            {
+                "transaction_id": txn_ids,
+                "customer_id": txn_customers,
+                "event_ts_utc": txn_times,
+                "event_date_utc": [instant.date() for instant in txn_times],
+                "txn_type": ["purchase"] * len(txn_ids),
+                "amount": txn_amounts,
+                "loaded_at": [datetime(2026, 12, 1, tzinfo=UTC)] * len(txn_ids),
+            }
+        ),
+        "fact_events": pl.DataFrame(
+            {
+                "event_id": event_ids,
+                "customer_id": event_customers,
+                "event_ts_utc": event_times,
+                "event_date_utc": [instant.date() for instant in event_times],
+                "event_type": event_types,
+                "loaded_at": [datetime(2026, 12, 1, tzinfo=UTC)] * len(event_ids),
+            }
+        ),
+    }
+    for name, frame in tables.items():
+        for day in frame["event_date_utc"].unique():
+            folder = root / name / f"event_date_utc={day}"
+            folder.mkdir(parents=True, exist_ok=True)
+            frame.filter(pl.col("event_date_utc") == day).write_parquet(folder / "data.parquet")
+    event_dates = tables["fact_events"]["event_date_utc"]
+    manifest = {
+        "data_label": "synthetic",
+        "timezone": "UTC",
+        "include_truth": False,
+        "row_counts": {
+            "dim_customer": dim.height,
+            "fact_transactions": len(txn_ids),
+            "fact_events": len(event_ids),
+        },
+        "event_date_utc_range": [
+            str(event_dates.min()),
+            str(event_dates.max()),
+        ],
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest))
+
+
 def _all_data(out: Path) -> dict[str, list[tuple]]:
     with connect(out) as con:
         return {
@@ -130,12 +225,66 @@ def test_cross_file_join_stored_order_and_exact_rfm(warehouse):
             "SELECT customer_id, recency, frequency, monetary FROM gold.fact_rfm_snapshot"
         ).fetchall()
         # 05:30 UTC is Jan 4 in New York but Jan 3 in Los Angeles; 07:59:59.5
-        # is still inside Los Angeles's half-open local-day cutoff.
+        # is inside the half-open local day ending at next local midnight, which
+        # is the same cutoff ccc.gold.rfm_snapshot now applies.
         assert rfm == [("c1", 1, 1, 10.0), ("c2", 0, 3, 90.0)]
         engagement = con.execute(
             "SELECT customer_id, app_open_count, repayment_count FROM gold.fact_engagement_snapshot"
         ).fetchall()
         assert engagement == [("c1", 1, 0), ("c2", 1, 1)]
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [date(2026, 1, 3), date(2026, 11, 1), date(2026, 3, 8)],
+    ids=["winter", "fall-back-dst", "spring-forward-dst"],
+)
+def test_duck_gold_matches_canonical_boundary_rfm_and_engagement(tmp_path, snapshot):
+    parquet_dir = tmp_path / "parquet"
+    out = tmp_path / "warehouse"
+    _write_boundary_export(parquet_dir, snapshot)
+    build(parquet_dir, out, snapshot_date=snapshot.isoformat())
+
+    with connect(out) as con:
+        duck_rfm = [
+            (customer_id, str(day), recency, frequency, float(monetary))
+            for customer_id, day, recency, frequency, monetary in con.execute(
+                "SELECT customer_id, snapshot_date, recency, frequency, monetary "
+                "FROM gold.fact_rfm_snapshot ORDER BY customer_id"
+            ).fetchall()
+        ]
+        duck_engagement = con.execute(
+            "SELECT customer_id, app_open_count, repayment_count "
+            "FROM gold.fact_engagement_snapshot ORDER BY customer_id"
+        ).fetchall()
+
+    dim = pl.read_parquet(parquet_dir / "dim_customer.parquet")
+    transactions = pl.read_parquet(parquet_dir / "fact_transactions" / "**/*.parquet")
+    events = pl.read_parquet(parquet_dir / "fact_events" / "**/*.parquet")
+    canonical_rfm = rfm_snapshot(dim, transactions, snapshot, GOLD_WINDOWS)
+    canonical_rfm_rows = [
+        (
+            row["customer_id"],
+            row["snapshot_date"].isoformat(),
+            row["recency"],
+            row["frequency"],
+            float(row["monetary"]),
+        )
+        for row in canonical_rfm.select(
+            "customer_id", "snapshot_date", "recency", "frequency", "monetary"
+        ).iter_rows(named=True)
+    ]
+    canonical_engagement = [
+        (row["customer_id"], row["app_open_count"], row["repayment_count"])
+        for row in engagement_features(events, dim, snapshot).iter_rows(named=True)
+    ]
+
+    assert duck_rfm == canonical_rfm_rows
+    assert duck_rfm == [
+        ("la", snapshot.isoformat(), 0, 1, 10.0),
+        ("ny", snapshot.isoformat(), 0, 1, 10.0),
+    ]
+    assert duck_engagement == canonical_engagement == [("la", 2, 1), ("ny", 2, 1)]
 
 
 def test_connect_sql_runs_from_output_directory(warehouse, monkeypatch):
@@ -225,6 +374,82 @@ def test_failed_rebuild_keeps_current_and_cleans_stage(parquet_export, warehouse
     assert _current(warehouse) == old_current
     assert _all_data(warehouse) == old_data
     assert not list(warehouse.glob(".stage-*"))
+
+
+def _published(warehouse: Path) -> list[Path]:
+    return sorted(
+        (path for path in warehouse.glob("build-*") if path.is_dir() and not path.is_symlink()),
+        key=lambda path: path.name,
+    )
+
+
+def test_normal_rebuild_retains_all_published_builds(parquet_export, warehouse):
+    first = _current(warehouse)
+    build(parquet_export, warehouse, snapshot_date="2026-01-03")
+    second = _current(warehouse)
+    build(parquet_export, warehouse, snapshot_date="2026-01-03")
+    third = _current(warehouse)
+    builds = _published(warehouse)
+    assert len(builds) == 3
+    assert first in builds and second in builds and third in builds
+    assert (warehouse / "current").resolve() == third
+
+
+def test_prune_builds_requires_reader_stop_acknowledgement(parquet_export, warehouse):
+    before = _published(warehouse)
+    with pytest.raises(ValueError, match="acknowledge_readers_stopped=True"):
+        prune_builds(warehouse)
+    assert _published(warehouse) == before
+
+
+def test_prune_builds_preserves_current_stages_and_unrelated_paths(parquet_export, warehouse):
+    build(parquet_export, warehouse, snapshot_date="2026-01-03")
+    build(parquet_export, warehouse, snapshot_date="2026-01-03")
+    builds = _published(warehouse)
+    current = _current(warehouse)
+    assert len(builds) == 3
+
+    live_stage = warehouse / ".stage-live"
+    live_stage.mkdir()
+    stage_link = warehouse / ".stage-link"
+    stage_link.symlink_to(live_stage.name, target_is_directory=True)
+    unrelated = warehouse / "keep.txt"
+    unrelated.write_text("mine")
+    malformed = warehouse / "build-notes"
+    malformed.mkdir()
+    malformed_build = warehouse / "build-20260101T000000000000Z-nothex"
+    malformed_build.mkdir()
+
+    removed = prune_builds(warehouse, keep_last=2, acknowledge_readers_stopped=True)
+
+    assert removed == [builds[0]]
+    assert not builds[0].exists()
+    assert builds[1].is_dir() and builds[2].is_dir()
+    assert current == builds[2]
+    assert _current(warehouse) == current
+    assert live_stage.is_dir()
+    assert stage_link.is_symlink()
+    assert unrelated.read_text() == "mine"
+    assert malformed.is_dir()
+    assert malformed_build.is_dir()
+
+
+def test_prune_builds_cli_requires_and_records_acknowledgement(parquet_export, warehouse):
+    build(parquet_export, warehouse, snapshot_date="2026-01-03")
+    builds = _published(warehouse)
+    with pytest.raises(ValueError, match="acknowledge_readers_stopped=True"):
+        main(["--out-dir", str(warehouse), "--prune-builds"])
+    main(
+        [
+            "--out-dir",
+            str(warehouse),
+            "--prune-builds",
+            "--acknowledge-readers-stopped",
+        ]
+    )
+    assert not builds[0].exists()
+    assert builds[1].is_dir()
+    assert _current(warehouse) == builds[1]
 
 
 @pytest.mark.parametrize("kind", ["file", "directory"])
