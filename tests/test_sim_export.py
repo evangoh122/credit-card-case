@@ -6,7 +6,7 @@ import duckdb
 import polars as pl
 import pytest
 
-from ccc.sim import export, run
+from ccc.sim import export, profiles, run
 from ccc.sim.scenario import Scenario
 from tests.conftest import START
 
@@ -36,6 +36,32 @@ def test_chunked_equals_unchunked(sc):
         chunked = run.simulate(SEED, DAYS, sc, batch_size=size)
         for name, df in whole.items():
             assert df.equals(chunked[name]), (name, size)
+
+
+def test_simulate_forwards_locale_for_unchunked_and_chunked():
+    sc = Scenario("locale", START, initial_customers=8, arrivals_per_day=0.0)
+    specs = run.cohort_specs(SEED, sc, 2)
+    expected = profiles.identities(
+        SEED, [(cid, join_day) for cid, _, join_day in specs], sc.start_date, "ja_JP"
+    )
+    expected_names = dict(zip(expected["customer_id"], expected["name"], strict=True))
+    english = run.simulate(SEED, 2, sc)["dim_customer"]
+    english_names = dict(zip(english["customer_id"], english["name"], strict=True))
+    assert english_names != expected_names
+    for batch_size in (None, 3):
+        actual = run.simulate(SEED, 2, sc, locale="ja_JP", batch_size=batch_size)["dim_customer"]
+        actual_names = dict(zip(actual["customer_id"], actual["name"], strict=True))
+        assert actual_names == expected_names, batch_size
+
+
+def test_zero_transaction_export_is_rejected_with_clear_error(tmp_path):
+    sc = Scenario("empty", START, initial_customers=0, arrivals_per_day=0.0)
+    assert run.cohort_specs(SEED, sc, 2) == []
+    out = tmp_path / "empty"
+    with pytest.raises(ValueError, match="produced zero transactions"):
+        export.export(out, SEED, 2, sc, batch_size=10, workers=1)
+    assert not out.exists() or not any(out.iterdir())
+    assert not (out / ".staging").exists()
 
 
 def test_exported_facts_equal_unchunked_simulation(out, sc):

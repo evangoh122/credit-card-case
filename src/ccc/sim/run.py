@@ -103,7 +103,7 @@ def simulate(
         loaded_at = default_loaded_at(sc, days)
     step = batch_size or max(1, len(specs))
     batches = [specs[i : i + step] for i in range(0, len(specs), step)] or [[]]
-    chunks = [simulate_chunk(seed, days, sc, b, loaded_at, synth) for b in batches]
+    chunks = [simulate_chunk(seed, days, sc, b, loaded_at, synth, locale=locale) for b in batches]
     if len(chunks) == 1:
         return chunks[0]
     out = {name: pl.concat([c[name] for c in chunks]) for name in chunks[0]}

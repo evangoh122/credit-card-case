@@ -170,6 +170,12 @@ def _export(
                 for name, n in counts.items():
                     staged[name] += n
 
+        if staged["fact_transactions"] == 0:
+            raise ValueError(
+                "simulation produced zero transactions; nothing to export "
+                "(check initial_customers and arrivals_per_day)"
+            )
+
         con = duckdb.connect()
         con.execute(f"SET memory_limit = '{memory_limit}'")
         con.execute(f"SET temp_directory = '{staging / 'duckdb_tmp'}'")
