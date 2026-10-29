@@ -183,12 +183,19 @@ def _build_hub(path: Path, built_at: datetime) -> None:
         con.execute("INSERT INTO build_metadata VALUES (?)", [built_at])
 
 
-def _write_connect_sql(path: Path) -> None:
+def _write_connect_sql(path: Path, build_id: str) -> None:
+    build_relative = Path(build_id)
     path.write_text(
         "-- Run from the warehouse output directory.\n"
-        "ATTACH 'current/dim.duckdb' AS dim (READ_ONLY);\n"
-        "ATTACH 'current/facts.duckdb' AS facts (READ_ONLY);\n"
-        "ATTACH 'current/gold.duckdb' AS gold (READ_ONLY);\n"
+        "-- Every ATTACH pins this immutable published build, so swapping the\n"
+        "-- current symlink cannot mix files from different generations.\n"
+        "SET TimeZone = 'UTC';\n"
+        f"ATTACH '{_sql_string((build_relative / 'dim.duckdb').as_posix())}' "
+        "AS dim (READ_ONLY);\n"
+        f"ATTACH '{_sql_string((build_relative / 'facts.duckdb').as_posix())}' "
+        "AS facts (READ_ONLY);\n"
+        f"ATTACH '{_sql_string((build_relative / 'gold.duckdb').as_posix())}' "
+        "AS gold (READ_ONLY);\n"
     )
 
 
@@ -269,7 +276,7 @@ def build(
             raise ValueError("manifest event_date_utc_range must contain two dates")
         _build_gold(gold_path, dim_path, facts_path, snapshot_date or dates[1])
         _build_hub(stage / "hub.duckdb", datetime.now(UTC))
-        _write_connect_sql(stage / "connect.sql")
+        _write_connect_sql(stage / "connect.sql", build_id)
         _check_integrity_dir(stage, manifest.get("row_counts", {}))
         for wal in stage.rglob("*.wal"):
             wal.unlink()

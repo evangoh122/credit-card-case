@@ -297,6 +297,121 @@ def test_connect_sql_runs_from_output_directory(warehouse, monkeypatch):
         ).fetchone() == (5,)
 
 
+def _write_generation_export(root: Path, prefix: str) -> None:
+    root.mkdir()
+    first, second = f"{prefix}1", f"{prefix}2"
+    dim = pl.DataFrame(
+        {
+            "customer_id": [first, second],
+            "city": ["New York", "Los Angeles"],
+            "tz": ["America/New_York", "America/Los_Angeles"],
+            "joined_ts_utc": [datetime(2026, 1, 1, tzinfo=UTC)] * 2,
+            "loaded_at": [datetime(2026, 1, 5, tzinfo=UTC)] * 2,
+        }
+    )
+    dim.write_parquet(root / "dim_customer.parquet")
+    tables = {
+        "fact_transactions": pl.DataFrame(
+            {
+                "transaction_id": [f"{prefix}-txn-1", f"{prefix}-txn-2"],
+                "customer_id": [first, second],
+                "event_ts_utc": [datetime(2026, 1, 2, 12, tzinfo=UTC)] * 2,
+                "event_date_utc": [date(2026, 1, 2)] * 2,
+                "txn_type": ["purchase", "purchase"],
+                "amount": [10.0, 20.0],
+                "loaded_at": [datetime(2026, 1, 5, tzinfo=UTC)] * 2,
+            }
+        ),
+        "fact_events": pl.DataFrame(
+            {
+                "event_id": [f"{prefix}-evt-1", f"{prefix}-evt-2"],
+                "customer_id": [first, second],
+                "event_ts_utc": [datetime(2026, 1, 2, 13, tzinfo=UTC)] * 2,
+                "event_date_utc": [date(2026, 1, 2)] * 2,
+                "event_type": ["app_open", "repayment"],
+                "loaded_at": [datetime(2026, 1, 5, tzinfo=UTC)] * 2,
+            }
+        ),
+    }
+    for name, frame in tables.items():
+        folder = root / name / "event_date_utc=2026-01-02"
+        folder.mkdir(parents=True)
+        frame.write_parquet(folder / "data.parquet")
+    manifest = {
+        "data_label": "synthetic",
+        "timezone": "UTC",
+        "include_truth": False,
+        "row_counts": {"dim_customer": 2, "fact_transactions": 2, "fact_events": 2},
+        "event_date_utc_range": ["2026-01-02", "2026-01-02"],
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest))
+
+
+def _point_current(out: Path, build_dir: Path) -> None:
+    pending = out / ".current-regression"
+    pending.symlink_to(build_dir.name, target_is_directory=True)
+    os.replace(pending, out / "current")
+
+
+def test_connect_sql_pins_one_generation_across_atomic_publication(tmp_path, monkeypatch):
+    out = tmp_path / "warehouse"
+    export_a = tmp_path / "export-a"
+    _write_generation_export(export_a, "a")
+    build(export_a, out)
+    build_a = _current(out)
+    sql = (build_a / "connect.sql").read_text()
+
+    export_b = tmp_path / "export-b"
+    _write_generation_export(export_b, "b")
+    build(export_b, out)
+    build_b = _current(out)
+    assert build_b != build_a
+
+    _point_current(out, build_a)
+    assert _current(out) == build_a
+    monkeypatch.chdir(out)
+
+    statements = [statement.strip() for statement in sql.split(";") if statement.strip()]
+    assert any("AS dim" in statement for statement in statements)
+    with duckdb.connect() as con:
+        for statement in statements:
+            con.execute(statement)
+            if "AS dim" in statement:
+                _point_current(out, build_b)
+                assert _current(out) == build_b
+        dim_ids = con.execute(
+            "SELECT customer_id FROM dim.dim_customer ORDER BY customer_id"
+        ).fetchall()
+        fact_ids = con.execute(
+            "SELECT DISTINCT customer_id FROM facts.fact_transactions ORDER BY customer_id"
+        ).fetchall()
+        event_ids = con.execute(
+            "SELECT DISTINCT customer_id FROM facts.fact_events ORDER BY customer_id"
+        ).fetchall()
+        gold_ids = con.execute(
+            "SELECT customer_id FROM gold.fact_rfm_snapshot ORDER BY customer_id"
+        ).fetchall()
+        orphans = con.execute(
+            "SELECT count(*) FROM (SELECT customer_id FROM facts.fact_transactions "
+            "EXCEPT SELECT customer_id FROM dim.dim_customer)"
+        ).fetchone()[0]
+        joined = con.execute(
+            "SELECT count(*) FROM facts.fact_transactions f "
+            "JOIN dim.dim_customer d USING (customer_id)"
+        ).fetchone()[0]
+
+    expected = [("a1",), ("a2",)]
+    assert dim_ids == expected
+    assert fact_ids == expected, (
+        f"connect.sql mixed generations after current swap: dim={dim_ids} "
+        f"facts={fact_ids} orphans={orphans}"
+    )
+    assert event_ids == expected
+    assert gold_ids == expected
+    assert orphans == 0
+    assert joined == 2
+
+
 def test_orphan_and_null_customer_fail_integrity(warehouse):
     facts = _current(warehouse) / "facts.duckdb"
     with duckdb.connect(str(facts)) as con:

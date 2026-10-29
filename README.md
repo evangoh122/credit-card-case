@@ -25,7 +25,9 @@ uv run ruff check . && uv run ruff format --check .
 - Build connected DuckDB files with `python -m ccc.duck.build --parquet-dir DIR --out-dir DIR`.
   After `from ccc.duck import connect`, `with connect(DIR) as con:` attaches `dim`, `facts`, and `gold`, so
   `con.sql("SELECT * FROM facts.fact_transactions JOIN dim.dim_customer USING (customer_id)")`
-  works across files; from the output directory, DuckDB CLI/UI users can run `current/connect.sql`.
+  works across files; DuckDB CLI/UI users can run `current/connect.sql` after changing to the
+  warehouse output directory. That script pins every `ATTACH` to the immutable `build-*` directory it
+  was generated for, so moving `current` during the run cannot mix generations.
 - Every build publishes an immutable `build-*` directory and atomically moves the `current` symlink;
   normal builds never delete old builds, because an existing reader may still have one open. To reclaim
   space, stop every consumer that may use candidate builds and run the explicit maintenance command
