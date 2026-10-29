@@ -1,0 +1,274 @@
+import signal
+import socket
+import subprocess
+import sys
+from unittest import mock
+
+import pytest
+
+from ccc import tracking, ui
+
+
+def test_mlflow_command_uses_study_store(tmp_path):
+    cmd = ui.mlflow_command(tmp_path, 5000)
+    assert cmd[:4] == [sys.executable, "-m", "mlflow", "ui"]
+    assert cmd[cmd.index("--backend-store-uri") + 1] == tracking.default_tracking_uri(tmp_path)
+    assert cmd[cmd.index("--port") + 1] == "5000"
+
+
+def test_mlflow_command_explicit_uri_wins(tmp_path):
+    cmd = ui.mlflow_command(tmp_path, 5001, "sqlite:///x.db")
+    assert cmd[cmd.index("--backend-store-uri") + 1] == "sqlite:///x.db"
+    assert cmd[cmd.index("--port") + 1] == "5001"
+
+
+def test_evidently_command(tmp_path):
+    cmd = ui.evidently_command(tmp_path / "ws", 8000)
+    assert cmd[cmd.index("-c") + 2] == "ui"
+    assert cmd[cmd.index("--workspace") + 1] == str(tmp_path / "ws")
+    assert cmd[cmd.index("--port") + 1] == "8000"
+
+
+def test_defaults():
+    assert (ui.MLFLOW_PORT, ui.EVIDENTLY_PORT) == (5000, 8000)
+
+
+def test_port_in_use_is_clear_error():
+    with socket.socket() as busy:
+        busy.bind((ui.HOST, 0))
+        port = busy.getsockname()[1]
+        with pytest.raises(SystemExit, match=f"port {port}.*already in use"):
+            ui.check_port_free(port)
+
+
+def test_main_builds_both_commands_and_prints_urls(tmp_path, capsys):
+    with (
+        mock.patch.object(ui, "check_port_free"),
+        mock.patch.object(ui, "serve", return_value=0) as serve,
+    ):
+        rc = ui.main(["--tracking-dir", str(tmp_path), "--workspace", str(tmp_path / "ws")])
+    assert rc == 0
+    mlflow_cmd, evidently_cmd = serve.call_args.args[0]
+    assert mlflow_cmd[mlflow_cmd.index("--port") + 1] == "5000"
+    assert evidently_cmd[evidently_cmd.index("--port") + 1] == "8000"
+    out = capsys.readouterr().out
+    assert "http://127.0.0.1:5000" in out and "http://127.0.0.1:8000" in out
+    assert (tmp_path / "ws").is_dir()
+
+
+def test_main_rejects_same_port():
+    with pytest.raises(SystemExit):
+        ui.main(["--port", "7000", "--evidently-port", "7000"])
+
+
+unix_only = pytest.mark.skipif(sys.platform == "win32", reason="process groups are Unix-only")
+
+
+def _fake_proc(pid):
+    p = mock.Mock(pid=pid, returncode=None)
+    p.poll.return_value = None
+    return p
+
+
+@unix_only
+def test_serve_stops_every_child_even_if_one_already_exited():
+    procs = [_fake_proc(101), _fake_proc(102)]
+    procs[0].wait.side_effect = [KeyboardInterrupt, None, None]
+    sent = []
+
+    def killpg(pid, sig):
+        sent.append((pid, sig))
+        if pid == 101:
+            raise ProcessLookupError
+
+    with (
+        mock.patch.object(subprocess, "Popen", side_effect=procs) as popen,
+        mock.patch.object(ui, "IS_WINDOWS", False),
+        mock.patch.object(ui.os, "killpg", side_effect=killpg),
+    ):
+        assert ui.serve([["a"], ["b"]]) == 0
+    assert all(c.kwargs["start_new_session"] for c in popen.call_args_list)
+    assert (102, signal.SIGTERM) in sent and (102, signal.SIGKILL) in sent
+    procs[1].wait.assert_called()
+
+
+@unix_only
+def test_serve_cleans_up_first_child_when_second_spawn_fails():
+    first = _fake_proc(201)
+    with (
+        mock.patch.object(subprocess, "Popen", side_effect=[first, OSError("boom")]),
+        mock.patch.object(ui, "IS_WINDOWS", False),
+        mock.patch.object(ui.os, "killpg") as killpg,
+        pytest.raises(OSError),
+    ):
+        ui.serve([["a"], ["b"]])
+    killpg.assert_any_call(201, signal.SIGTERM)
+    first.wait.assert_called()
+
+
+@unix_only
+def test_stop_kills_group_when_child_ignores_sigterm():
+    p = _fake_proc(301)
+    p.wait.side_effect = [subprocess.TimeoutExpired("x", 1), None]
+    with mock.patch.object(ui, "IS_WINDOWS", False), mock.patch.object(ui.os, "killpg") as killpg:
+        ui._stop([p])
+    assert [c.args for c in killpg.call_args_list] == [
+        (301, signal.SIGTERM),
+        (301, signal.SIGKILL),
+    ]
+
+
+def _run_result(returncode):
+    return mock.Mock(returncode=returncode)
+
+
+def test_stop_windows_forces_tree_first_and_stops_every_child():
+    gone, live = _fake_proc(401), _fake_proc(402)
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(ui.os, "killpg", create=True) as killpg,
+        mock.patch.object(subprocess, "run", return_value=_run_result(0)) as run,
+    ):
+        ui._stop([gone, live])
+    killpg.assert_not_called()
+    cmds = [c.args[0] for c in run.call_args_list]
+    assert cmds == [
+        ["taskkill", "/PID", "401", "/F", "/T"],
+        ["taskkill", "/PID", "402", "/F", "/T"],
+    ]
+    assert all(c.kwargs["check"] is False for c in run.call_args_list)
+    gone.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
+    live.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
+
+
+def test_stop_windows_taskkill_fails_child_alive_kills_and_reports_without_hanging(capsys):
+    stuck, other = _fake_proc(601), _fake_proc(602)
+    stuck.wait.side_effect = subprocess.TimeoutExpired("x", 1)  # never exits
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(subprocess, "run", return_value=_run_result(1)),
+    ):
+        ui._stop([stuck, other])  # must return, not raise
+    stuck.kill.assert_called_once()
+    stuck.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
+    err = capsys.readouterr().err
+    assert "taskkill failed for child pid 601: exit code 1" in err
+    assert "failed to stop child pid 601" in err
+    other.wait.assert_called_once()  # other children are still stopped
+
+
+def test_stop_windows_taskkill_failure_reported_even_when_kill_succeeds(capsys):
+    p = _fake_proc(651)
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(subprocess, "run", return_value=_run_result(5)),
+    ):
+        ui._stop([p])  # kill works, wait returns normally
+    p.kill.assert_called_once()
+    err = capsys.readouterr().err
+    assert "taskkill failed for child pid 651: exit code 5" in err
+    assert "failed to stop" not in err
+
+
+def test_stop_windows_taskkill_fails_but_child_already_exited_is_fine(capsys):
+    p = _fake_proc(701)
+    p.poll.return_value = 1
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(subprocess, "run", return_value=_run_result(128)),
+    ):
+        ui._stop([p])
+    p.kill.assert_not_called()
+    assert capsys.readouterr().err == ""
+
+
+def test_stop_windows_falls_back_when_taskkill_missing():
+    p = _fake_proc(501)
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(subprocess, "run", side_effect=FileNotFoundError),
+    ):
+        ui._stop([p])
+    p.kill.assert_called_once()
+    p.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
+
+
+class _Child:
+    """Fake Popen: poll() walks `polls`; once signalled it exits with `forced`."""
+
+    def __init__(self, pid, polls, forced=1):
+        self.pid, self._polls, self.forced = pid, list(polls), forced
+        self.signalled = False
+        self.returncode = None
+        self.on_signal = None  # side effect run when this child is signalled
+
+    def poll(self):
+        code = self.forced if self.signalled else self._polls[0]
+        if len(self._polls) > 1 and not self.signalled:
+            self._polls.pop(0)
+        self.returncode = code
+        return code
+
+    def wait(self, timeout=None):
+        if self.poll() is None:
+            raise subprocess.TimeoutExpired("x", timeout)
+
+    def kill(self):
+        self.signalled = True
+
+    terminate = kill
+
+
+def _serve_windows(children, interrupt=True):
+    killed = []
+
+    def taskkill(cmd, **kw):
+        child = next(c for c in children if str(c.pid) == cmd[2])
+        child.signalled = True
+        killed.append(child.pid)
+        if child.on_signal:
+            child.on_signal()
+        return _run_result(0)
+
+    first_wait = children[0].wait
+
+    def wait(timeout=None):
+        if interrupt and not killed and not getattr(wait, "raised", False):
+            wait.raised = True
+            raise KeyboardInterrupt
+        first_wait(timeout)
+
+    children[0].wait = wait
+    with (
+        mock.patch.object(subprocess, "Popen", side_effect=children),
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(subprocess, "run", side_effect=taskkill),
+    ):
+        return ui.serve([["a"], ["b"]])
+
+
+def test_serve_ctrl_c_with_forced_stop_codes_returns_zero():
+    children = [_Child(801, [None], forced=1), _Child(802, [None], forced=1)]
+    assert _serve_windows(children) == 0
+
+
+def test_serve_child_that_crashed_before_shutdown_keeps_its_code():
+    crashed, other = _Child(811, [3]), _Child(812, [None], forced=1)
+    assert _serve_windows([crashed, other], interrupt=False) == 3
+
+
+def test_serve_child_exiting_between_poll_and_signal_keeps_its_code():
+    # B dies on its own (code 3) only as a side effect of A being signalled: after any global
+    # pre-stop snapshot, but before B itself is signalled. Needs per-child poll-then-signal.
+    a, b = _Child(821, [None], forced=1), _Child(822, [None], forced=1)
+    a.on_signal = lambda: setattr(b, "_polls", [3])
+    assert _serve_windows([a, b]) == 3
+
+
+def test_popen_kwargs_per_platform():
+    with mock.patch.object(ui, "IS_WINDOWS", False):
+        assert ui._popen_kwargs() == {"start_new_session": True}
+    with mock.patch.object(ui, "IS_WINDOWS", True):
+        kw = ui._popen_kwargs()
+    assert kw["creationflags"] == getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+    assert "start_new_session" not in kw

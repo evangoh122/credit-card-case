@@ -243,10 +243,14 @@ def _finite(metrics: dict[str, float]) -> dict[str, float]:
     return {k: v for k, v in metrics.items() if math.isfinite(v)}
 
 
+def default_tracking_uri(tracking_dir: str | Path) -> str:
+    return f"sqlite:///{Path(tracking_dir).resolve() / 'mlflow.db'}"
+
+
 def _setup(tracking_dir: Path, tracking_uri: str | None, experiment: str) -> str:
     tracking_dir = Path(tracking_dir).resolve()
     tracking_dir.mkdir(parents=True, exist_ok=True)
-    mlflow.set_tracking_uri(tracking_uri or f"sqlite:///{tracking_dir / 'mlflow.db'}")
+    mlflow.set_tracking_uri(tracking_uri or default_tracking_uri(tracking_dir))
     found = mlflow.get_experiment_by_name(experiment)
     if found is not None:
         return found.experiment_id
