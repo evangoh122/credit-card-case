@@ -46,3 +46,10 @@ uv run ruff check . && uv run ruff format --check .
   child per seed) and checks planted campaign effects are recovered across seeds. Run
   `uv run python -m ccc.run_study --scenario scenarios/default.toml --seeds 1 2 3 --n-initial 300`;
   the store is `./mlruns` (gitignored); `--sdv-scores` needs `--profiles copula`.
+
+## Layout: `original/` vs `src/ccc`
+
+- `src/ccc` (this package, Python 3.12) is the seeded simulator described above.
+- `original/` is the earlier v7 credit-card dataset generator, imported with its history. It has its
+  own `pyproject.toml` and targets Python 3.13; run its commands from inside that folder. The root
+  ruff and pytest configs skip it. See `original/README.md`.
