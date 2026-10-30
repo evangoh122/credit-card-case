@@ -24,6 +24,11 @@ uv run ruff check . && uv run ruff format --check .
 - `ccc.geo`: US city to IANA time-zone mapping.
 - `ccc.sim`: seeded simulator (profiles, events, scenario overlay). Run
   `uv run python -m ccc.sim --seed 1 --days 60 --scenario scenarios/default.toml --out data/sim`.
+  `uv run python -m ccc.sim.export --seed 1 --target-transactions 15000000 --out data/export`
+  writes chunked, zstd, date-partitioned Parquet via DuckDB (`manifest.json` has counts and
+  versions; `sim_truth_customer` only with `--include-truth`). `ccc.sim.upload` pushes it to a
+  Hugging Face dataset (`HF_TOKEN` env var, `pip install '.[hf]'`);
+  `notebooks/colab_generate_15m.ipynb` does both on Colab.
   Tests that fit SDV are marked `slow` (`uv run pytest -m slow`).
 - `ccc.tracking`, `python -m ccc.run_study`: logs a seeded study to MLflow (parent run per study,
   child per seed) and checks planted campaign effects are recovered across seeds. Run
