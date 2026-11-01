@@ -15,6 +15,11 @@ wheels/
 .pytest_cache/
 _stash_*/
 
+# Agent/IDE scaffolding and archived review transcripts (never part of a PR)
+.claude/
+.agents/
+docs/archive/
+
 # Local-only working files (never part of a PR)
 plans/
 evidence/builder_provenance.txt

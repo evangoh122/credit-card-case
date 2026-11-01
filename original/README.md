@@ -21,7 +21,8 @@ US card issuer, expanded into a star schema with an operational raw mirror.
 | `credit_card_data_v3/` | rejected |
 | `credit_card_data_v2/`, `credit_card_data/` | earlier prototypes, 5k scale |
 
-See `docs/archive/hand_off_v6.md` for the full release record and reviewer responses.
+The archived release record and reviewer transcripts from the upstream project are
+not included in this import.
 
 ---
 
@@ -183,7 +184,7 @@ GROUP BY 1 ORDER BY spend DESC;
 - **Frequency is segmented and overdispersed** — median 14 per account-month,
   p95 66, max 450.
 - **No causal structure.** Limits affect approved spend mechanically; λ is
-  untouched; there is no treatment assignment. See `docs/archive/hand_off_v6.md` §12.
+  untouched; there is no treatment assignment.
 - **Fraud is separable by construction** — loss is calibrated to 6.94 bps of spend,
   but the label derives from a score, so a model will separate it easily.
 - **`RETURNED` payments are not exercised.**
@@ -192,3 +193,10 @@ GROUP BY 1 ORDER BY spend DESC;
 - **Raw layer is a sample** (~1.2% of transactions), internally connected.
 - **Identifiers are synthetic but not reserved-range** (ordinary email domains and
   ordinary-looking US phone numbers).
+
+---
+
+## 7. License
+
+No license is specified for this project. No `LICENSE` file has been added to this
+repository, so the terms of use are undecided pending an owner decision.
