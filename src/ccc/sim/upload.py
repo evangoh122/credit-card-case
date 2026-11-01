@@ -3,7 +3,7 @@
     HF_TOKEN=... python -m ccc.sim.upload --dir DIR --repo-id USER/NAME
 
 The token is read only from the HF_TOKEN environment variable. The repo must already exist
-unless --create is given. Needs the optional extra: pip install 'ccc[hf]'.
+unless --create is given. Needs the optional extra: uv sync --extra hf.
 """
 
 import argparse

@@ -27,7 +27,7 @@ uv run ruff check . && uv run ruff format --check .
   `uv run python -m ccc.sim.export --seed 1 --target-transactions 15000000 --out data/export`
   writes chunked, zstd, date-partitioned Parquet via DuckDB (`manifest.json` has counts and
   versions; `sim_truth_customer` only with `--include-truth`). `ccc.sim.upload` pushes it to a
-  Hugging Face dataset (`HF_TOKEN` env var, `pip install '.[hf]'`);
+  Hugging Face dataset (`HF_TOKEN` env var, `uv sync --extra hf`);
   `notebooks/colab_generate_15m.ipynb` does both on Colab.
   Tests that fit SDV are marked `slow` (`uv run pytest -m slow`).
 - Build connected DuckDB files with `uv run python -m ccc.duck.build --parquet-dir DIR --out-dir DIR`.
@@ -49,5 +49,6 @@ uv run ruff check . && uv run ruff format --check .
 - `uv run python -m ccc.ui`: starts the MLflow UI (study store, `:5000`) and the Evidently UI (`:8000`,
   workspace `./evidently_workspace`, gitignored); Ctrl-C stops both. `uv run python -m ccc.evidently_data
   --scenario scenarios/default.toml` writes a `DataDriftPreset`
-  snapshot there (pre-start vs late joiners, observable features only). `requirements.txt` is
-  `uv export --no-hashes --no-dev`.
+  snapshot there (pre-start vs late joiners, observable features only); drift frames stay Polars
+  until the Evidently `Report.run` boundary. Dependencies are locked by `uv lock`; check with
+  `uv lock --check`.

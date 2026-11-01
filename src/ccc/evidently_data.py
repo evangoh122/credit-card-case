@@ -4,7 +4,6 @@ import sys
 from datetime import date
 from pathlib import Path
 
-import pandas as pd
 import polars as pl
 
 from ccc import gold
@@ -27,7 +26,7 @@ PROJECT_NAME = "ccc-drift"
 
 def drift_frames(
     tables: dict[str, pl.DataFrame], start_date: date, days: int, cohort_day: int
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Observable features at the end of the run. Reference is customers who joined before the
     simulation start; current is customers who joined from cohort_day on."""
     if cohort_day < 1 or days <= cohort_day:
@@ -54,12 +53,12 @@ def drift_frames(
     for frame in (reference, current):
         frame = frame.select(FEATURES)
         gold.guard_no_truth_columns(frame)
-        out.append(frame.to_pandas())
+        out.append(frame)
     return out[0], out[1]
 
 
 def write_drift_snapshot(
-    reference: pd.DataFrame, current: pd.DataFrame, workspace: str | Path
+    reference: pl.DataFrame, current: pl.DataFrame, workspace: str | Path
 ) -> str:
     from evidently import Report
     from evidently.presets import DataDriftPreset
@@ -68,7 +67,7 @@ def write_drift_snapshot(
     ws = Workspace.create(str(workspace))
     found = ws.search_project(PROJECT_NAME)
     project = found[0] if found else ws.create_project(PROJECT_NAME)
-    snapshot = Report([DataDriftPreset()]).run(current, reference)
+    snapshot = Report([DataDriftPreset()]).run(current.to_pandas(), reference.to_pandas())
     ws.add_run(project.id, snapshot)
     return str(project.id)
 

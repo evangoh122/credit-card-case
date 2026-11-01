@@ -1,4 +1,6 @@
+import ast
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -70,6 +72,19 @@ def test_frames_have_only_observable_features():
     for frame in evidently_data.drift_frames(_tables(), START, days=30, cohort_day=15):
         assert list(frame.columns) == list(evidently_data.FEATURES)
         assert not TRUTH_COLUMNS & set(frame.columns)
+
+
+def test_drift_frames_stay_polars_and_module_never_imports_pandas():
+    tree = ast.parse(Path(evidently_data.__file__).read_text())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert "pandas" not in imported
+    ref, cur = evidently_data.drift_frames(_tables(), START, days=30, cohort_day=15)
+    assert isinstance(ref, pl.DataFrame) and isinstance(cur, pl.DataFrame)
 
 
 def test_truth_column_in_features_is_rejected(monkeypatch):
