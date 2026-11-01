@@ -25,8 +25,10 @@ uv run ruff check . && uv run ruff format --check .
 ## CI and secret scanning
 
 - `ci.yml` runs `uv sync --locked`, tests and ruff; `dependency-audit.yml` exports the
-  locked runtime dependencies with `uv export` and fails only on vulnerabilities that
-  have a fix available.
+  locked runtime dependencies with `uv export` (plus a Windows-targeted view so
+  Windows-only pins such as `waitress` are covered), audits the exported pins directly
+  with pip-audit, and fails only on vulnerabilities that have a fix available. Scheduled
+  runs fail the workflow as well, so failures trigger notifications.
 - `secrets.yml` scans pull requests from the base branch's copy of the workflow
   (`pull_request_target`), so a pull request cannot replace the scan with a no-op.
   The pull request head is only fetched as git data, never executed, and
