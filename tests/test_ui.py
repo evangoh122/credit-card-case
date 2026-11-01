@@ -193,6 +193,27 @@ def test_stop_windows_falls_back_when_taskkill_missing():
     p.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
 
 
+def test_stop_windows_bounds_taskkill_and_falls_back_on_timeout(capsys):
+    stuck, other = _fake_proc(551), _fake_proc(552)
+    stuck.wait.side_effect = [subprocess.TimeoutExpired("x", 1), None]
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(
+            subprocess, "run", side_effect=subprocess.TimeoutExpired("taskkill", 1)
+        ) as run,
+    ):
+        ui._stop([stuck, other])  # must return, not raise
+    assert all(c.kwargs["timeout"] == ui.STOP_TIMEOUT_S for c in run.call_args_list)
+    assert [c.args[0][2] for c in run.call_args_list] == ["551", "552"]
+    stuck.kill.assert_called_once()  # fallback still force-kills the direct child
+    other.kill.assert_called_once()
+    stuck.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
+    other.wait.assert_called_once_with(timeout=ui.STOP_TIMEOUT_S)
+    err = capsys.readouterr().err
+    assert f"taskkill failed for child pid 551: timed out after {ui.STOP_TIMEOUT_S}s" in err
+    assert "failed to stop child pid 551" in err
+
+
 class _Child:
     """Fake Popen: poll() walks `polls`; once signalled it exits with `forced`."""
 

@@ -1,6 +1,6 @@
 """Upload an exported dataset directory to a Hugging Face dataset repo.
 
-    HF_TOKEN=... python -m ccc.sim.upload --dir DIR --repo-id USER/NAME
+    HF_TOKEN=... uv run --extra hf python -m ccc.sim.upload --dir DIR --repo-id USER/NAME
 
 The token is read only from the HF_TOKEN environment variable. The repo must already exist
 unless --create is given. Needs the optional extra: uv sync --extra hf.
@@ -27,7 +27,7 @@ def upload(folder: Path, repo_id: str, token: str, create: bool = False) -> None
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(prog="python -m ccc.sim.upload")
+    ap = argparse.ArgumentParser(prog="uv run --extra hf python -m ccc.sim.upload")
     ap.add_argument("--dir", required=True, type=Path)
     ap.add_argument("--repo-id", required=True, help="e.g. user/credit-card-case-synthetic")
     ap.add_argument("--create", action="store_true", help="create the dataset repo if missing")

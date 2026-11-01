@@ -54,9 +54,14 @@ def _taskkill_tree(p: subprocess.Popen) -> None:
     """Force-kill the child's whole process tree; fall back to the direct child on failure."""
     try:
         result = subprocess.run(
-            ["taskkill", "/PID", str(p.pid), "/F", "/T"], check=False, capture_output=True
+            ["taskkill", "/PID", str(p.pid), "/F", "/T"],
+            check=False,
+            capture_output=True,
+            timeout=STOP_TIMEOUT_S,
         )
         failed, detail = result.returncode != 0, f"exit code {result.returncode}"
+    except subprocess.TimeoutExpired:  # stalled taskkill: fall back to the direct child
+        failed, detail = True, f"timed out after {STOP_TIMEOUT_S}s"
     except OSError as exc:  # taskkill missing
         failed, detail = True, f"unavailable ({exc})"
     if failed and p.poll() is None:  # nonzero while the child is already gone is fine

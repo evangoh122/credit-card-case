@@ -27,7 +27,8 @@ uv run ruff check . && uv run ruff format --check .
   `uv run python -m ccc.sim.export --seed 1 --target-transactions 15000000 --out data/export`
   writes chunked, zstd, date-partitioned Parquet via DuckDB (`manifest.json` has counts and
   versions; `sim_truth_customer` only with `--include-truth`). `ccc.sim.upload` pushes it to a
-  Hugging Face dataset (`HF_TOKEN` env var, `uv sync --extra hf`);
+  Hugging Face dataset (`HF_TOKEN` env var, `uv sync --extra hf`):
+  `HF_TOKEN=... uv run --extra hf python -m ccc.sim.upload --dir DIR --repo-id USER/NAME`;
   `notebooks/colab_generate_15m.ipynb` does both on Colab.
   Tests that fit SDV are marked `slow` (`uv run pytest -m slow`).
 - Build connected DuckDB files with `uv run python -m ccc.duck.build --parquet-dir DIR --out-dir DIR`.
