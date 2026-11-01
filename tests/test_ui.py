@@ -170,7 +170,9 @@ def test_stop_windows_taskkill_failure_reported_even_when_kill_succeeds(capsys):
     assert "failed to stop" not in err
 
 
-def test_stop_windows_taskkill_fails_but_child_already_exited_is_fine(capsys):
+def test_stop_windows_taskkill_failure_after_child_exit_warns_about_descendants(capsys):
+    # MLflow runs the server as a descendant; the direct child exiting does not prove the
+    # tree is gone, so a failed taskkill must still be reported.
     p = _fake_proc(701)
     p.poll.return_value = 1
     with (
@@ -179,7 +181,23 @@ def test_stop_windows_taskkill_fails_but_child_already_exited_is_fine(capsys):
     ):
         ui._stop([p])
     p.kill.assert_not_called()
-    assert capsys.readouterr().err == ""
+    err = capsys.readouterr().err
+    assert "taskkill failed for child pid 701: exit code 128" in err
+    assert "descendants may still be running" in err
+
+
+def test_stop_windows_taskkill_timeout_after_child_exit_warns_about_descendants(capsys):
+    p = _fake_proc(711)
+    p.poll.return_value = 0
+    with (
+        mock.patch.object(ui, "IS_WINDOWS", True),
+        mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("taskkill", 1)),
+    ):
+        ui._stop([p])
+    p.kill.assert_not_called()
+    err = capsys.readouterr().err
+    assert f"taskkill failed for child pid 711: timed out after {ui.STOP_TIMEOUT_S}s" in err
+    assert "descendants may still be running" in err
 
 
 def test_stop_windows_falls_back_when_taskkill_missing():

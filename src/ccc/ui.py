@@ -64,12 +64,14 @@ def _taskkill_tree(p: subprocess.Popen) -> None:
         failed, detail = True, f"timed out after {STOP_TIMEOUT_S}s"
     except OSError as exc:  # taskkill missing
         failed, detail = True, f"unavailable ({exc})"
-    if failed and p.poll() is None:  # nonzero while the child is already gone is fine
+    if failed:
         print(
-            f"taskkill failed for child pid {p.pid}: {detail}; killing it directly", file=sys.stderr
+            f"taskkill failed for child pid {p.pid}: {detail}; descendants may still be running",
+            file=sys.stderr,
         )
-        with contextlib.suppress(OSError):
-            p.kill()
+        if p.poll() is None:  # don't signal a child that already exited on its own
+            with contextlib.suppress(OSError):
+                p.kill()
 
 
 def _signal_group(p: subprocess.Popen, force: bool) -> None:
