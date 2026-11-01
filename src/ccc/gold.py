@@ -43,6 +43,7 @@ def _require_columns(frame: pl.DataFrame, required: set[str], name: str) -> None
 
 
 def _zone_cutoffs(snapshot_date: date, zones: pl.Series) -> pl.DataFrame:
+    """Exclusive next-local-midnight cutoffs for each customer zone."""
     validate_zones(zones)
     names = sorted(zones.unique().to_list())
     return pl.DataFrame(
@@ -218,7 +219,7 @@ def rfm_snapshot(
     cutoffs = _zone_cutoffs(snapshot_date, purchases.get_column("tz"))
     purchases = purchases.join(cutoffs, on="tz", how="left").filter(
         (pl.col("event_local_date") <= snapshot_date)
-        & (pl.col("event_ts_utc") <= pl.col("cutoff_utc"))
+        & (pl.col("event_ts_utc") < pl.col("cutoff_utc"))
     )
     result = (
         dim.filter(pl.col("join_local_date") <= snapshot_date)
@@ -270,7 +271,7 @@ def engagement_features(
     cutoffs = _zone_cutoffs(snapshot_date, events.get_column("tz"))
     filtered = events.join(cutoffs, on="tz", how="left").filter(
         (pl.col("event_local_date") <= snapshot_date)
-        & (pl.col("event_ts_utc") <= pl.col("cutoff_utc"))
+        & (pl.col("event_ts_utc") < pl.col("cutoff_utc"))
     )
     return (
         filtered.group_by("customer_id", maintain_order=True)
@@ -326,10 +327,11 @@ def count_late_events(
         {"cutoff_utc": "current_cutoff_utc"}
     )
     local = local.join(previous, on="tz", how="left").join(current, on="tz", how="left")
+    # Cutoffs are half-open [previous local midnight, current local midnight).
     return local.filter(
         (pl.col("event_local_date") <= previous_snapshot_date)
-        & (pl.col("loaded_at") > pl.col("previous_cutoff_utc"))
-        & (pl.col("loaded_at") <= pl.col("current_cutoff_utc"))
+        & (pl.col("loaded_at") >= pl.col("previous_cutoff_utc"))
+        & (pl.col("loaded_at") < pl.col("current_cutoff_utc"))
     ).height
 
 

@@ -94,7 +94,7 @@ Time
 - UTC is the storage format. Every timestamp (`event_ts_utc`, `joined_ts_utc`, `loaded_at`) is timezone-aware UTC and every stored date (`event_date_utc`, snapshot and assignment dates) is a UTC date.
 - `dim_customer` carries stable `city` and `tz` (IANA zone name, never a fixed offset); it stores no local-time columns. Local business dates are derived at feature/query time from the UTC instant plus the customer's zone.
 - DST days are 23 or 25 hours: use calendar days per zone, never 24h arithmetic. US DST began 2026-03-08 and ends 2026-11-01; Phoenix and Honolulu are always 24h.
-- Snapshot cutoff is 23:59:59 local per customer zone, converted to a UTC instant; point-in-time rule is local event date <= snapshot date. Snapshots are frozen once written; late events land in the next snapshot and their count is logged.
+- The snapshot cutoff is the next local midnight (exclusive) per customer zone, converted to a UTC instant, so a snapshot includes the complete local calendar day including fractional seconds and 23/25-hour DST days; point-in-time rule is local event date <= snapshot date. Snapshots are frozen once written; late events land in the next snapshot and their count is logged.
 - Local wall times convert to UTC only when explicitly given (campaign 09:00 local). Ambiguous fall-back times use the first occurrence; nonexistent spring-forward times shift forward by the gap.
 - Campaigns are local wall-time windows interpreted per customer zone. Simulation uses a fixed calendar, never now().
 

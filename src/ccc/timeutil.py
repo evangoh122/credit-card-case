@@ -119,7 +119,14 @@ def local_day_hours(d: date, tz: str) -> float:
 
 
 def snapshot_cutoff_utc(snapshot_date: date, tz: str) -> datetime:
-    return local_to_utc(datetime.combine(snapshot_date, time(23, 59, 59)), tz)
+    """Exclusive end of a customer-local calendar day as a UTC instant.
+
+    The snapshot for ``snapshot_date`` includes every instant in that local day,
+    so the half-open interval ends at the next local midnight. Building it from
+    local wall time keeps 23/25-hour DST days exact and preserves fractional
+    seconds instead of rounding down to 23:59:59.
+    """
+    return local_to_utc(datetime.combine(snapshot_date + timedelta(days=1), time()), tz)
 
 
 def sim_date(start: date, offset: int) -> date:
