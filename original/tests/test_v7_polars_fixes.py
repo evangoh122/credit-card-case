@@ -126,6 +126,31 @@ def test_credit_default_excludes_accounts_closed_on_or_before_obs(captured):
     assert feats.label_default.to_dict() == {"AC1": 0, "AC2": 1}
 
 
+def test_credit_default_excludes_account_charged_off_on_obs(captured):
+    d = lambda days: OBS + pd.Timedelta(days=days)  # noqa: E731
+    accounts = pd.DataFrame({
+        "account_id": ["AC1", "AC2"], "customer_id": ["C1", "C2"],
+        "product_id": "P", "open_date": d(-300),
+        "account_status": ["OPEN", "CHARGED_OFF"],
+        # AC2 is charged off exactly on the observation date, so the <= rule
+        # must exclude it rather than rely on its status alone.
+        "closed_date": [pd.NaT, d(0)],
+    })
+    stmts = _stmts(["C1", "C2"])
+    stmts["account_id"] = ["AC1", "AC2"]
+    delinq = pd.DataFrame({"account_id": ["AC1", "AC2"],
+                           "snapshot_date": OBS - pd.Timedelta(days=2),
+                           "days_past_due": [0, 0], "delinquency_status": "CURRENT"})
+    tx = _tx(["C1", "C2"])
+    tx["account_id"] = ["AC1", "AC2"]
+    stmts["billed_amount"], stmts["payment_due_date"] = 2.0, OBS + pd.Timedelta(days=20)
+    alloc = pd.DataFrame({"account_id": [], "payment_date": [], "amount_usd": [], "payment_type": []})
+    ml_extracts.build_credit_default(tx, accounts, _customers(), stmts, delinq, alloc)
+    feats = captured["credit_default_features"].set_index("account_id")
+    assert set(feats.index) == {"AC1"}
+    assert feats.label_default.to_dict() == {"AC1": 0}
+
+
 @pytest.mark.parametrize("task", ["churn", "credit_default"])
 def test_label_column_gate_fails_on_every_defining_column(task):
     ok, _ = ml_extracts.check_no_label_columns(pd.DataFrame({"x": [1]}), task)
