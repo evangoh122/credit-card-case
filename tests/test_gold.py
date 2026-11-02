@@ -18,7 +18,12 @@ from ccc.gold import (
 from ccc.segmentation import fit_tiered
 from ccc.sim.run import simulate
 from ccc.sim.scenario import Scenario
-from ccc.timeutil import local_date_expr, local_day_hours, snapshot_cutoff_utc
+from ccc.timeutil import (
+    local_date_expr,
+    local_day_hours,
+    local_to_utc,
+    snapshot_cutoff_utc,
+)
 
 WINDOWS = {"recency": 30, "frequency": 30, "monetary": 30}
 
@@ -109,6 +114,61 @@ def test_rfm_uses_each_customers_local_cutoff():
     west = result.filter(pl.col("customer_id") == "west").row(0, named=True)
     assert (east["frequency"], east["recency"]) == (0, None)
     assert (west["frequency"], west["recency"]) == (1, 0)
+
+
+def test_gold_includes_fractional_last_second_and_excludes_next_midnight():
+    snapshot = date(2026, 1, 3)
+    zones = {"east": "America/New_York", "west": "America/Los_Angeles"}
+    dim = pl.DataFrame(
+        {
+            "customer_id": list(zones),
+            "tz": list(zones.values()),
+            "joined_ts_utc": [datetime(2025, 12, 1, 12, tzinfo=UTC)] * 2,
+        },
+        schema_overrides={"joined_ts_utc": pl.Datetime("us", "UTC")},
+    )
+    txn_customers, txn_amounts, txn_times = [], [], []
+    event_customers, event_types, event_times = [], [], []
+    for customer_id, tz in zones.items():
+        just_before = local_to_utc(datetime(2026, 1, 3, 23, 59, 59, 500000), tz)
+        at_midnight = snapshot_cutoff_utc(snapshot, tz)
+        after_midnight = at_midnight + timedelta(microseconds=500000)
+        for instant, amount in (
+            (just_before, 10.0),
+            (at_midnight, 11.0),
+            (after_midnight, 12.0),
+        ):
+            txn_customers.append(customer_id)
+            txn_amounts.append(amount)
+            txn_times.append(instant)
+            event_customers.append(customer_id)
+            event_types.append("app_open")
+            event_times.append(instant)
+        event_customers.append(customer_id)
+        event_types.append("repayment")
+        event_times.append(just_before)
+    transactions = pl.DataFrame(
+        {
+            "customer_id": txn_customers,
+            "txn_type": ["purchase"] * len(txn_customers),
+            "amount": txn_amounts,
+            "event_ts_utc": txn_times,
+        },
+        schema_overrides={"event_ts_utc": pl.Datetime("us", "UTC")},
+    )
+    events = pl.DataFrame(
+        {
+            "customer_id": event_customers,
+            "event_type": event_types,
+            "event_ts_utc": event_times,
+        },
+        schema_overrides={"event_ts_utc": pl.Datetime("us", "UTC")},
+    )
+    result = rfm_snapshot(dim, transactions, snapshot, WINDOWS)
+    for row in result.iter_rows(named=True):
+        assert (row["recency"], row["frequency"], row["monetary"]) == (0, 1, 10.0)
+    engagement = engagement_features(events, dim, snapshot)
+    assert engagement.select("app_open_count", "repayment_count").rows() == [(1, 1), (1, 1)]
 
 
 def test_late_event_is_judged_against_each_customers_cutoff():
@@ -399,8 +459,8 @@ def test_late_events_are_counted_and_logged_for_next_snapshot(tmp_path):
     current = date(2026, 11, 2)
     previous_cutoff = snapshot_cutoff_utc(previous, "America/New_York")
     current_cutoff = snapshot_cutoff_utc(current, "America/New_York")
-    assert previous_cutoff == datetime(2026, 11, 2, 4, 59, 59, tzinfo=UTC)
-    assert current_cutoff == datetime(2026, 11, 3, 4, 59, 59, tzinfo=UTC)
+    assert previous_cutoff == datetime(2026, 11, 2, 5, tzinfo=UTC)
+    assert current_cutoff == datetime(2026, 11, 3, 5, tzinfo=UTC)
     events = pl.DataFrame(
         {
             "customer_id": ["a"] * 6,

@@ -142,18 +142,36 @@ def test_calendar_window_across_spring_forward():
     assert hi - lo == timedelta(days=7) - timedelta(hours=1)
 
 
-def test_snapshot_cutoff_is_local_235959_per_zone():
+def test_snapshot_cutoff_is_next_local_midnight_exclusive_per_zone():
     ny = snapshot_cutoff_utc(date(2026, 11, 1), "America/New_York")
     la = snapshot_cutoff_utc(date(2026, 11, 1), "America/Los_Angeles")
     phx = snapshot_cutoff_utc(date(2026, 11, 1), "America/Phoenix")
     hnl = snapshot_cutoff_utc(date(2026, 11, 1), "Pacific/Honolulu")
-    assert ny == utc(2026, 11, 2, 4, 59, 59)
-    assert la == utc(2026, 11, 2, 7, 59, 59)
-    assert phx == utc(2026, 11, 2, 6, 59, 59)
-    assert hnl == utc(2026, 11, 2, 9, 59, 59)
+    assert ny == utc(2026, 11, 2, 5)
+    assert la == utc(2026, 11, 2, 8)
+    assert phx == utc(2026, 11, 2, 7)
+    assert hnl == utc(2026, 11, 2, 10)
     for tz, cutoff in (("America/New_York", ny), ("America/Los_Angeles", la)):
-        assert utc_to_local_date(cutoff, tz) == date(2026, 11, 1)
-        assert utc_to_local_date(cutoff + timedelta(seconds=1), tz) == date(2026, 11, 2)
+        assert cutoff == local_to_utc(datetime(2026, 11, 2), tz)
+        assert utc_to_local_date(cutoff - timedelta(microseconds=1), tz) == date(2026, 11, 1)
+        assert utc_to_local_date(cutoff, tz) == date(2026, 11, 2)
+
+
+def test_snapshot_cutoff_keeps_fractional_last_second():
+    for tz in ("America/New_York", "America/Los_Angeles"):
+        cutoff = snapshot_cutoff_utc(date(2026, 1, 3), tz)
+        just_before = local_to_utc(datetime(2026, 1, 3, 23, 59, 59, 500000), tz)
+        assert just_before < cutoff
+        assert utc_to_local_date(just_before, tz) == date(2026, 1, 3)
+        assert utc_to_local_date(cutoff, tz) == date(2026, 1, 4)
+
+
+def test_snapshot_cutoff_tracks_dst_day_lengths():
+    # New York's 2026-11-01 local day is 25 hours and 2026-03-08 is 23 hours.
+    assert snapshot_cutoff_utc(date(2026, 11, 1), "America/New_York") == utc(2026, 11, 2, 5)
+    assert snapshot_cutoff_utc(date(2026, 3, 8), "America/New_York") == utc(2026, 3, 9, 4)
+    assert local_day_hours(date(2026, 11, 1), "America/New_York") == 25
+    assert local_day_hours(date(2026, 3, 8), "America/New_York") == 23
 
 
 def test_event_before_pacific_cutoff_but_after_eastern_cutoff():
@@ -165,15 +183,11 @@ def test_event_before_pacific_cutoff_but_after_eastern_cutoff():
 
 
 def test_dst_cutoffs_on_both_sides_of_each_transition():
-    assert snapshot_cutoff_utc(date(2026, 10, 31), "America/New_York") == utc(
-        2026, 11, 1, 3, 59, 59
-    )
-    assert snapshot_cutoff_utc(date(2026, 3, 7), "America/New_York") == utc(2026, 3, 8, 4, 59, 59)
-    assert snapshot_cutoff_utc(date(2026, 3, 8), "America/New_York") == utc(2026, 3, 9, 3, 59, 59)
+    assert snapshot_cutoff_utc(date(2026, 10, 31), "America/New_York") == utc(2026, 11, 1, 4)
+    assert snapshot_cutoff_utc(date(2026, 3, 7), "America/New_York") == utc(2026, 3, 8, 5)
+    assert snapshot_cutoff_utc(date(2026, 3, 8), "America/New_York") == utc(2026, 3, 9, 4)
     # A fixed -5h offset would put the Nov 1 cutoff an hour late.
-    assert snapshot_cutoff_utc(date(2026, 10, 31), "America/New_York") != utc(
-        2026, 11, 1, 4, 59, 59
-    )
+    assert snapshot_cutoff_utc(date(2026, 10, 31), "America/New_York") != utc(2026, 11, 1, 5)
 
 
 def test_sim_date_uses_calendar_days():
