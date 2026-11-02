@@ -97,6 +97,31 @@ def test_credit_default_features_exclude_label_columns(captured):
     assert feats.label_default.to_dict() == {"AC1": 0, "AC2": 1}  # label intact
 
 
+def test_credit_default_excludes_accounts_closed_on_or_before_obs(captured):
+    d = lambda days: OBS + pd.Timedelta(days=days)  # noqa: E731
+    accounts = pd.DataFrame({
+        "account_id": ["AC1", "AC2", "AC3"], "customer_id": ["C1", "C2", "C3"],
+        "product_id": "P", "open_date": d(-300),
+        "account_status": ["OPEN", "CHARGED_OFF", "CLOSED"],
+        # AC2 charges off inside the outcome window; AC3 closed before obs and
+        # therefore has no future snapshot that could carry a label.
+        "closed_date": [pd.NaT, d(20), d(-10)],
+    })
+    stmts = _stmts(["C1", "C2", "C3"])
+    stmts["account_id"] = ["AC1", "AC2", "AC3"]
+    delinq = pd.DataFrame({"account_id": ["AC1", "AC2", "AC3"],
+                           "snapshot_date": OBS - pd.Timedelta(days=2),
+                           "days_past_due": [0, 0, 0], "delinquency_status": "CURRENT"})
+    tx = _tx(["C1", "C2", "C3"])
+    tx["account_id"] = ["AC1", "AC2", "AC3"]
+    stmts["billed_amount"], stmts["payment_due_date"] = 2.0, OBS + pd.Timedelta(days=20)
+    alloc = pd.DataFrame({"account_id": [], "payment_date": [], "amount_usd": [], "payment_type": []})
+    ml_extracts.build_credit_default(tx, accounts, _customers(), stmts, delinq, alloc)
+    feats = captured["credit_default_features"].set_index("account_id")
+    assert set(feats.index) == {"AC1", "AC2"}
+    assert feats.label_default.to_dict() == {"AC1": 0, "AC2": 1}
+
+
 @pytest.mark.parametrize("task", ["churn", "credit_default"])
 def test_label_column_gate_fails_on_every_defining_column(task):
     ok, _ = ml_extracts.check_no_label_columns(pd.DataFrame({"x": [1]}), task)

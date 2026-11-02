@@ -671,6 +671,9 @@ def build_credit_default(df: pd.DataFrame, accounts: pd.DataFrame,
                       "customer_segment", "risk_tier"]]
     feats = feats.merge(cust, on="customer_id", how="left")
 
+    closed_before = set(acct.loc[acct.closed_date.notna() & (acct.closed_date <= obs),
+                                 "account_id"])
+    feats = feats[~feats.account_id.isin(closed_before)].reset_index(drop=True)
     future = ds[(ds.snapshot_date > obs) & (ds.snapshot_date <= end)]
     default_ids = set(future.loc[future.days_past_due >= 60, "account_id"])
     default_ids |= set(acct.loc[(acct.account_status == "CHARGED_OFF")
