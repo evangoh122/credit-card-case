@@ -10,7 +10,7 @@ every result instead of only the last one.
 """
 from __future__ import annotations
 
-import pandas as pd
+import polars as pl
 
 CHECKS: list[tuple[str, bool, str]] = []
 
@@ -20,7 +20,7 @@ def _record(name: str, ok: bool, detail: str) -> bool:
     return bool(ok)
 
 
-def check_continuity(statements: pd.DataFrame, tolerance: float = 0.01) -> bool:
+def check_continuity(statements: pl.DataFrame | object, tolerance: float = 0.01) -> bool:
     """Every statement must open at the previous statement's closing balance.
 
     Statements are grouped per account and ordered by statement date. The first
@@ -28,25 +28,24 @@ def check_continuity(statements: pd.DataFrame, tolerance: float = 0.01) -> bool:
     balance from before the fact window); every later statement must continue
     the previous closing balance within ``tolerance``.
     """
-    ordered = statements.sort_values(["account_id", "statement_date"])
-    problems: list[str] = []
-    checked = 0
-    for account_id, group in ordered.groupby("account_id", sort=False):
-        previous_closing = None
-        for row in group.itertuples():
-            if previous_closing is not None:
-                checked += 1
-                opening = row.opening_balance
-                if pd.isna(previous_closing) or pd.isna(opening):
-                    problems.append(
-                        f"{account_id}@{row.statement_date}: missing balance")
-                elif abs(float(opening) - float(previous_closing)) > tolerance:
-                    problems.append(
-                        f"{account_id}@{row.statement_date}: opening "
-                        f"{float(opening):.2f} != previous closing "
-                        f"{float(previous_closing):.2f}")
-            previous_closing = row.closing_balance
+    frame = (statements if isinstance(statements, pl.DataFrame)
+             else pl.from_pandas(statements))
+    ordered = frame.sort(["account_id", "statement_date"]).with_columns(
+        pl.col("closing_balance").shift(1).over("account_id").alias("_prev_closing")
+    )
+    continuations = ordered.filter(pl.col("_prev_closing").is_not_null())
+    with_prev = pl.col("_prev_closing")
+    bad = continuations.filter(
+        pl.col("opening_balance").is_null()
+        | with_prev.is_null()
+        | ((pl.col("opening_balance") - with_prev).abs() > tolerance)
+    )
+    problems = [
+        f"{row['account_id']}@{row['statement_date']}: opening "
+        f"{row['opening_balance']} != previous closing {row['_prev_closing']}"
+        for row in bad.iter_rows(named=True)
+    ]
     ok = not problems
-    detail = (f"{checked} statement continuations checked" if ok
+    detail = (f"{continuations.height} statement continuations checked" if ok
               else "; ".join(problems[:10]))
     return _record("statement continuity", ok, detail)
