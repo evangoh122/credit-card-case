@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from build import dimensions, raw_mirror
+from build import config as C, dimensions, facts, raw_mirror
 from build.facts import (
     Buf,
     _emit_plan_v2,
@@ -90,6 +90,67 @@ class InstallmentLifecycleTests(unittest.TestCase):
         self.assertTrue((after_close.paid_amount == 0).all())
         self.assertTrue((after_close.paid_date.isna()).all())
         self.assertEqual(plan.frame().iloc[0].plan_status, "CANCELLED")
+
+
+def _plan_dims() -> dict:
+    """Minimal dimensions that drive one open and one planned-closed account."""
+    merchants = pd.DataFrame([
+        dict(merchant_id=f"M{i}", merchant_name=f"merchant {i}", mcc=code,
+             category=category, geo_id=1, is_international=False,
+             is_recurring=False, popularity_weight=1.0 / len(C.MCC_CATALOG))
+        for i, (code, _desc, category, *_rest) in enumerate(C.MCC_CATALOG)
+    ])
+    customers = pd.DataFrame([
+        dict(customer_id="C_OPEN", customer_segment="AFFLUENT_POWER", home_geo_id=1),
+        dict(customer_id="C_CLOSE", customer_segment="AFFLUENT_POWER", home_geo_id=1),
+    ])
+    product_id = C.PRODUCTS[0]["product_id"]
+    accounts = pd.DataFrame([
+        dict(account_id="A_OPEN", customer_id="C_OPEN", product_id=product_id,
+             open_date=dt.date(2023, 1, 1), planned_close_date=None,
+             credit_limit=60000.0, apr_purchase=0.22, statement_day=5,
+             foreign_txn_fee=0.0),
+        dict(account_id="A_CLOSE", customer_id="C_CLOSE", product_id=product_id,
+             open_date=dt.date(2023, 1, 1), planned_close_date=dt.date(2026, 6, 30),
+             credit_limit=60000.0, apr_purchase=0.22, statement_day=5,
+             foreign_txn_fee=0.0),
+    ])
+    cards = pd.DataFrame([
+        dict(account_id="A_OPEN", card_id="K_OPEN",
+             issue_date=dt.date(2023, 1, 1), replaced_date=None),
+        dict(account_id="A_CLOSE", card_id="K_CLOSE",
+             issue_date=dt.date(2023, 1, 1), replaced_date=None),
+    ])
+    return dict(dim_account=accounts, dim_customer=customers, dim_merchant=merchants,
+                dim_channel=pd.DataFrame(C.CHANNELS), dim_card=cards)
+
+
+class SimulatedPlanCloseDateTests(unittest.TestCase):
+    """An account without a planned close keeps its post-period plans open."""
+
+    @classmethod
+    def setUpClass(cls):
+        out = facts.simulate_v2(_plan_dims())
+        cls.plan = out["plan"].frame()
+        cls.sched = out["sched"].frame()
+
+    def test_open_account_plans_are_not_cancelled_at_period_end(self):
+        open_plans = self.plan[self.plan.account_id == "A_OPEN"]
+        self.assertGreater(len(open_plans), 0)
+        self.assertFalse((open_plans.plan_status == "CANCELLED").any())
+        open_sched = self.sched[self.sched.account_id == "A_OPEN"]
+        beyond = open_sched[open_sched.due_date > C.PERIOD_END]
+        self.assertGreater(len(beyond), 0)
+        self.assertFalse((beyond.status == "CANCELLED").any())
+
+    def test_planned_close_still_cancels_only_installments_after_close(self):
+        close = dt.date(2026, 6, 30)
+        closed_sched = self.sched[self.sched.account_id == "A_CLOSE"]
+        after = closed_sched[closed_sched.due_date > close]
+        self.assertGreater(len(after), 0)
+        self.assertTrue((after.status == "CANCELLED").all())
+        within = closed_sched[closed_sched.due_date <= close]
+        self.assertFalse((within.status == "CANCELLED").any())
 
 
 class RawConnectivityTests(unittest.TestCase):

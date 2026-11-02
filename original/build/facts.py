@@ -1755,7 +1755,7 @@ def simulate_v2(dims: dict) -> dict:
                         added = _emit_plan_v2(rng, plan, sched, pid, a, a.customer_id,
                                               dict(transaction_id=ids[j],
                                                    date=pd.Timestamp(out["ts"][j]).date(),
-                                                   amount_usd=float(amt[j])), sched_no, eff_end)
+                                                   amount_usd=float(amt[j])), sched_no, planned_close)
                         sched_no += added
                         plan_no += 1
                         plan_ids[j] = pid
