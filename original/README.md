@@ -141,7 +141,10 @@ ML extracts keep label-defining columns (`customer_status`, `churn_date`,
 `ml_extracts.check_no_label_columns`. Credit-default `status_at_obs` / `paid_full_share_3m` are recomputed from
 payment allocations dated on or before the observation date (the final statement
 `payment_status` is settled with later cash); `max_source_date` includes payment
-dates. Tests: `tests/test_v7_asof_payments.py`. Round 6: the status replay uses the simulator's own
+dates. Accounts already closed on or before the observation date are excluded from
+the credit-default extract because no future snapshot can label them, and an
+installment plan is cancelled only after the account's true planned close, not at
+the period end. Tests: `tests/test_v7_asof_payments.py`. Round 6: the status replay uses the simulator's own
 `_waterfall`/`_settled_closing_amounts`/`_stmt_status`; fraud velocity features are
 strictly as-of (running day count, trailing-7-day spend); the forecast extract has
 train/test months with merchant selection and `seasonal_index` from train months

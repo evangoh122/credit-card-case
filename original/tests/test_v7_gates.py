@@ -14,7 +14,6 @@ import json
 from pathlib import Path
 
 import pandas as pd
-import pytest
 
 from build import config as C
 from build import run_all, validation
@@ -175,11 +174,6 @@ def test_ml_acceptance_gates_catch_bad_values():
 def test_independent_continuity_check_catches_seeded_defect():
     project_root = Path(__file__).resolve().parents[1]
     checks_path = project_root / "checks" / "independent_checks.py"
-    if not checks_path.is_file():
-        pytest.skip(
-            "independent checks module is not part of this import "
-            f"(missing: {checks_path.relative_to(project_root)})"
-        )
     spec = importlib.util.spec_from_file_location("independent_checks", checks_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
