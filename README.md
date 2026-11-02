@@ -46,3 +46,19 @@ uv run ruff check . && uv run ruff format --check .
   child per seed) and checks planted campaign effects are recovered across seeds. Run
   `uv run python -m ccc.run_study --scenario scenarios/default.toml --seeds 1 2 3 --n-initial 300`;
   the store is `./mlruns` (gitignored); `--sdv-scores` needs `--profiles copula`.
+
+## CI and secret scanning
+
+- `ci.yml` runs `uv sync --locked`, tests and ruff; `dependency-audit.yml` exports the
+  locked runtime dependencies with `uv export` (plus a Windows-targeted view so
+  Windows-only pins such as `waitress` are covered), audits the exported pins directly
+  with pip-audit, and fails only on vulnerabilities that have a fix available. Scheduled
+  runs fail the workflow as well, so failures trigger notifications.
+- `secrets.yml` scans pull requests from the base branch's copy of the workflow
+  (`pull_request_target`), so a pull request cannot replace the scan with a no-op.
+  The pull request head is only fetched as git data, never executed, and
+  `.gitleaks.toml` / `.gitleaksignore` always come from the base ref: ignore rules and
+  workflow edits apply after merge. The job keeps `contents: read`, no secrets, and a
+  pinned gitleaks binary; do not add checkout-and-run steps to it. It needs the
+  repository's Actions event policy to allow `pull_request_target` (GitHub's default
+  policy for public repositories blocks that event, enforced from 2026-12-02).
