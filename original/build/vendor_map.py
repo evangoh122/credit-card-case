@@ -1,12 +1,12 @@
 """Source vendor rename map.
 
-Every Philippine merchant in the Tyme extract is mapped to a fictional US brand.
+Every Philippine merchant in the Company Z extract is mapped to a fictional US brand.
 The MCC and analytical category are preserved exactly; only the name changes.
 
 Writes docs/source_vendor_rename_map.csv (one row per source vendor) and
 docs/source_vendor_rename_summary.md (category roll-up).
 
-If the Tyme extract is not present the step is skipped with a warning.
+If the Company Z extract is not present the step is skipped with a warning.
 """
 from __future__ import annotations
 

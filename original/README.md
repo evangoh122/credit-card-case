@@ -1,7 +1,7 @@
 # Synthetic US Credit Card Dataset — v6
 
-A synthetic US credit-card portfolio derived from the Tyme (Philippines) BNPL
-extract in `tyme_data_download/tyme`. The BNPL business model, Philippine
+A synthetic US credit-card portfolio derived from the Company Z (Philippines) BNPL
+extract in `company_z_data_download/company_z`. The BNPL business model, Philippine
 geography, PHP currency and Philippine identity data have been re-expressed as a
 US card issuer, expanded into a star schema with an operational raw mirror.
 
@@ -126,6 +126,9 @@ dim_customer --< dim_account --< dim_card
 $env:CC_OUT_DIR="credit_card_data_v7"
 python -m build.run_all       # postprocess + final validation run inside this command
 ```
+
+Set `CC_SOURCE_DIR` to point the build at a different source-extract folder; it
+defaults to `company_z_data_download/company_z`.
 
 The build exits non-zero if any validation check fails, and writes
 `release_manifest.json` plus `RELEASE_OK` or `RELEASE_FAILED`.

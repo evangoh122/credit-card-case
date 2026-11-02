@@ -1,6 +1,6 @@
 """Raw operational mirror.
 
-Rebuilds the *shape* of the original Tyme BNPL source tables as a US credit-card
+Rebuilds the *shape* of the original Company Z BNPL source tables as a US credit-card
 issuer would store them: same table names/columns (with `bnpl_` replaced by
 `card_`), DynamoDB-style attribute wrappers on the legacy tables, nested JSON
 payloads on the API/BFF tables, and US merchants, cities, banks and USD.

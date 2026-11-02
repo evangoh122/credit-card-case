@@ -23,7 +23,12 @@ DIM_DIR = OUT / "dim"
 FACT_DIR = OUT / "fact"
 RAW_DIR = OUT / "raw"
 DOC_DIR = OUT / "docs"
-SOURCE_DIR = ROOT / "tyme_data_download" / "tyme"
+# Source extract location. Defaults to the bundled layout and can be overridden
+# with CC_SOURCE_DIR to point at an on-disk copy:
+#   set CC_SOURCE_DIR=D:\data\company_z
+SOURCE_DIR = Path(
+    os.environ.get("CC_SOURCE_DIR", str(ROOT / "company_z_data_download" / "company_z"))
+)
 
 # --------------------------------------------------------------------------
 # Reproducibility & period

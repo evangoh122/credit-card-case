@@ -11,7 +11,7 @@ from .utils import ensure_dirs, log, run_step, write_parquet
 
 SOURCE_MAPPING = """# Source-to-target change log
 
-How each element of the Philippine BNPL source (`tyme_data_download/tyme`) was
+How each element of the Philippine BNPL source (`company_z_data_download/company_z`) was
 re-expressed for a US credit-card issuer.
 
 ## 1. Business model
