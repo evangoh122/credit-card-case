@@ -85,3 +85,10 @@ def test_refuses_truth_file(folder, monkeypatch):
     with pytest.raises(ValueError, match="planted truth"):
         _run(folder)
     assert FakeApi.instances == []
+
+
+def test_documented_invocation_uses_uv_with_hf_extra(capsys):
+    assert "uv run --extra hf python -m ccc.sim.upload" in upload.__doc__
+    with pytest.raises(SystemExit):
+        upload.main(["--help"])
+    assert "usage: uv run --extra hf python -m ccc.sim.upload" in capsys.readouterr().out
