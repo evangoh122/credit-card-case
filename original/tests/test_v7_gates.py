@@ -17,7 +17,7 @@ import pandas as pd
 import pytest
 
 from build import config as C
-from build import validation
+from build import run_all, validation
 from build.facts import _settled_closing_amounts
 from build.ml_extracts import check_drift, check_no_leakage, check_pr_auc
 from build.run_all import verify_manifest
@@ -196,3 +196,46 @@ def test_independent_continuity_check_catches_seeded_defect():
     stmt.loc[1, "opening_balance"] = 101.0
     mod.check_continuity(stmt)
     assert mod.CHECKS[-1][1] is False
+
+
+def test_accepted_limitations_exist_before_final_validation(monkeypatch, tmp_path):
+    """Validation requires the static docs, so write them before it runs."""
+    for attr, sub in (("OUT", None), ("DIM_DIR", "dim"), ("FACT_DIR", "fact"),
+                      ("RAW_DIR", "raw"), ("DOC_DIR", "docs")):
+        monkeypatch.setattr(C, attr, tmp_path if sub is None else tmp_path / sub)
+
+    monkeypatch.setattr(run_all.dimensions, "build_all",
+                        lambda: {"dim_customer": pd.DataFrame({"customer_id": ["C1"]})})
+    monkeypatch.setattr(run_all.facts, "build_all",
+                        lambda dims: {"dim_account": pd.DataFrame({"account_id": ["A1"]}),
+                                      "fact_x": pd.DataFrame({"x": [1]})})
+    monkeypatch.setattr(run_all.raw_mirror, "build_all",
+                        lambda dims, fact_tables: {"raw_x": pd.DataFrame({"x": [1]})})
+
+    def fake_write(df, path, name=None):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
+        return path
+
+    monkeypatch.setattr(run_all, "write_parquet", fake_write)
+    monkeypatch.setattr(run_all.postprocess, "main", lambda: 0)
+
+    class _Proc:
+        returncode = 0
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: _Proc())
+
+    seen = []
+
+    def fake_refresh():
+        seen.append((C.DOC_DIR / "accepted_limitations.md").exists())
+        return 0
+
+    monkeypatch.setattr(run_all.refresh_docs, "main", fake_refresh)
+    monkeypatch.setattr(run_all.validation, "LAST_FAIL_COUNT", 0)
+    monkeypatch.setattr(run_all.vendor_map, "run", lambda: None)
+    monkeypatch.setattr(run_all, "_write_manifest", lambda failed, started_at: None)
+
+    assert run_all.main() == 0
+    assert seen == [True]

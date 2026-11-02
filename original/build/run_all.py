@@ -362,6 +362,9 @@ def main() -> int:
         return 1
 
     log("Final validation and documentation on postprocessed files")
+    (C.DOC_DIR / "source_to_target_mapping.md").write_text(SOURCE_MAPPING, encoding="utf-8")
+    (C.DOC_DIR / "delinquency_extension.md").write_text(lifecycle_doc.TEXT, encoding="utf-8")
+    (C.DOC_DIR / "accepted_limitations.md").write_text(ACCEPTED_LIMITATIONS, encoding="utf-8")
     refresh_docs.main()
     failed = validation.LAST_FAIL_COUNT
 
@@ -371,9 +374,6 @@ def main() -> int:
     except Exception as e:
         log(f"  vendor rename map skipped: {e}")
 
-    (C.DOC_DIR / "source_to_target_mapping.md").write_text(SOURCE_MAPPING, encoding="utf-8")
-    (C.DOC_DIR / "delinquency_extension.md").write_text(lifecycle_doc.TEXT, encoding="utf-8")
-    (C.DOC_DIR / "accepted_limitations.md").write_text(ACCEPTED_LIMITATIONS, encoding="utf-8")
     _write_manifest(failed, started_at)
 
     total_rows = sum(n for _, n, _ in written)
