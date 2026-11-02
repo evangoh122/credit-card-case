@@ -100,20 +100,24 @@ def test_credit_default_features_exclude_label_columns(captured):
 def test_credit_default_excludes_accounts_closed_on_or_before_obs(captured):
     d = lambda days: OBS + pd.Timedelta(days=days)  # noqa: E731
     accounts = pd.DataFrame({
-        "account_id": ["AC1", "AC2", "AC3"], "customer_id": ["C1", "C2", "C3"],
+        "account_id": ["AC1", "AC2", "AC3", "AC4", "AC5"],
+        "customer_id": ["C1", "C2", "C3", "C4", "C4"],
         "product_id": "P", "open_date": d(-300),
-        "account_status": ["OPEN", "CHARGED_OFF", "CLOSED"],
-        # AC2 charges off inside the outcome window; AC3 closed before obs and
-        # therefore has no future snapshot that could carry a label.
-        "closed_date": [pd.NaT, d(20), d(-10)],
+        "account_status": ["OPEN", "CHARGED_OFF", "CLOSED", "CLOSED", "CHARGED_OFF"],
+        # AC2 charges off inside the outcome window and keeps its label; AC3
+        # closed before obs, AC4 closes exactly on obs, and AC5 was already
+        # charged off before obs: all three are excluded by the <= rule because
+        # no future snapshot can label them.
+        "closed_date": [pd.NaT, d(20), d(-10), d(0), d(-5)],
     })
-    stmts = _stmts(["C1", "C2", "C3"])
-    stmts["account_id"] = ["AC1", "AC2", "AC3"]
-    delinq = pd.DataFrame({"account_id": ["AC1", "AC2", "AC3"],
+    stmts = _stmts(["C1", "C2", "C3", "C4", "C4"])
+    stmts["account_id"] = ["AC1", "AC2", "AC3", "AC4", "AC5"]
+    delinq = pd.DataFrame({"account_id": ["AC1", "AC2", "AC3", "AC4", "AC5"],
                            "snapshot_date": OBS - pd.Timedelta(days=2),
-                           "days_past_due": [0, 0, 0], "delinquency_status": "CURRENT"})
-    tx = _tx(["C1", "C2", "C3"])
-    tx["account_id"] = ["AC1", "AC2", "AC3"]
+                           "days_past_due": [0, 0, 0, 0, 0],
+                           "delinquency_status": "CURRENT"})
+    tx = _tx(["C1", "C2", "C3", "C4", "C4"])
+    tx["account_id"] = ["AC1", "AC2", "AC3", "AC4", "AC5"]
     stmts["billed_amount"], stmts["payment_due_date"] = 2.0, OBS + pd.Timedelta(days=20)
     alloc = pd.DataFrame({"account_id": [], "payment_date": [], "amount_usd": [], "payment_type": []})
     ml_extracts.build_credit_default(tx, accounts, _customers(), stmts, delinq, alloc)

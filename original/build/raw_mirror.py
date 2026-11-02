@@ -893,4 +893,3 @@ def build_all(dims: dict, facts: dict) -> dict[str, pd.DataFrame]:
     out["profile_mapping"] = build_profile_mapping(cust)
     out.update(build_segment(facts["fact_app_event"], rng))
     return out
-
