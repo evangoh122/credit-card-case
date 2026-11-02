@@ -54,6 +54,13 @@ uv run ruff check . && uv run ruff format --check .
   until the Evidently `Report.run` boundary. Dependencies are locked by `uv lock`; check with
   `uv lock --check`.
 
+## Layout: `original/` vs `src/ccc`
+
+- `src/ccc` (this package, Python 3.12) is the seeded simulator described above.
+- `original/` is the earlier v7 credit-card dataset generator, imported with its history. It has its
+  own `pyproject.toml` and targets Python 3.13; run its commands from inside that folder. The root
+  ruff and pytest configs skip it. See `original/README.md`.
+
 ## CI and secret scanning
 
 - `ci.yml` runs `uv sync --locked`, tests and ruff; `dependency-audit.yml` exports the
