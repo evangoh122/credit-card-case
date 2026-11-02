@@ -1,0 +1,18 @@
+# Placeholder scenario for scheduled daily MLOps runs.
+# Keep values aligned with scenarios/default.toml until the skeleton is wired.
+name = "mlops_daily"
+start_date = 2026-10-19
+initial_customers = 2000
+arrivals_per_day = 40.0
+
+[growth]
+# Daily customer growth-rate range, per day. Placeholder until tuned.
+growth_rate_min = 0.0001
+growth_rate_max = 0.001
+
+[shift]
+# Placeholder distribution-shift controls; no shifts are applied yet.
+enabled = false
+cohort_shift_per_day = 0.0
+risk_z_per_day = 0.0
+purchase_mult = 1.0

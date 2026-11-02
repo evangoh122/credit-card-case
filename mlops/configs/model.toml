@@ -1,0 +1,13 @@
+# Placeholder model configuration for the MLOps skeleton.
+name = "placeholder_segmenter"
+version = "v0"
+target = "segment"
+snapshot_window_days = 30
+
+[intake]
+numeric = ["recency", "frequency", "monetary", "days_since_join"]
+categorical = ["channel", "region", "tz"]
+
+[training]
+seed_range = [1, 3]
+min_rows = 100
