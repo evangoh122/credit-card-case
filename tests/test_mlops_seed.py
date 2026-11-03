@@ -1,8 +1,8 @@
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from ccc.mlops.seed import MAX_SEED, derive_seed
+from ccc.mlops.seed import MAX_SEED, derive_seed, validate_run_date
 
 DAY = date(2026, 11, 3)
 
@@ -21,3 +21,14 @@ def test_seed_rejects_invalid_inputs():
         derive_seed(DAY, -1)
     with pytest.raises(ValueError, match="root_seed"):
         derive_seed(DAY, True)
+
+
+def test_seed_rejects_datetime_run_dates():
+    with pytest.raises(TypeError, match="datetime"):
+        derive_seed(datetime(2026, 11, 3, 12, 30), 7)
+    with pytest.raises(TypeError, match="datetime"):
+        derive_seed(datetime(2026, 11, 3, 12, 30, tzinfo=UTC), 7)
+
+
+def test_validate_run_date_returns_plain_dates():
+    assert validate_run_date(DAY) is DAY

@@ -1,5 +1,7 @@
+import json
 import socket
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
 import mlflow
 import pytest
@@ -63,3 +65,49 @@ def test_run_daily_refuses_to_overwrite_an_existing_date(tmp_path):
         daily.run_daily(date(2026, 11, 3), 2, target_dir=targets, tracking_dir=tracking)
     client = MlflowClient(tracking.as_uri())
     assert len(client.search_runs([first["experiment_id"]])) == 1
+
+
+def test_run_daily_publishes_a_complete_marker(tmp_path):
+    targets = tmp_path / "targets"
+    result = daily.run_daily(
+        date(2026, 11, 3), 7, target_dir=targets, tracking_dir=tmp_path / "mlruns"
+    )
+    marker = json.loads((targets / "2026-11-03" / "run.json").read_text())
+    assert marker == {"run_date": "2026-11-03", "derived_seed": result["derived_seed"]}
+    assert [p.name for p in targets.iterdir()] == ["2026-11-03"]
+
+
+def test_interrupted_marker_write_does_not_reserve_the_date(tmp_path, monkeypatch):
+    targets = tmp_path / "targets"
+    tracking = tmp_path / "mlruns"
+    real_write_text = Path.write_text
+    attempts = {"count": 0}
+
+    def fail_first_marker_write(self, *args, **kwargs):
+        if self.name == "run.json" and attempts["count"] == 0:
+            attempts["count"] += 1
+            raise OSError("disk full")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_first_marker_write)
+    with pytest.raises(OSError, match="disk full"):
+        daily.run_daily(date(2026, 11, 3), 7, target_dir=targets, tracking_dir=tracking)
+
+    assert not (targets / "2026-11-03").exists()
+    assert list(targets.iterdir()) == []
+
+    retried = daily.run_daily(date(2026, 11, 3), 7, target_dir=targets, tracking_dir=tracking)
+    assert (targets / "2026-11-03" / "run.json").is_file()
+    assert retried["target"] == str(targets / "2026-11-03")
+
+
+def test_run_daily_rejects_datetime_before_creating_the_target(tmp_path):
+    targets = tmp_path / "targets"
+    with pytest.raises(TypeError, match="datetime"):
+        daily.run_daily(
+            datetime(2026, 11, 3, 12, 30),
+            7,
+            target_dir=targets,
+            tracking_dir=tmp_path / "mlruns",
+        )
+    assert not targets.exists()

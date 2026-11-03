@@ -57,9 +57,11 @@ uv run ruff check . && uv run ruff format --check .
 ## MLOps skeleton
 
 `mlops/` holds a minimal, append-only MLOps skeleton (no data, network, Hugging Face or
-Databricks writes; no scheduled workflow yet). Python code is packaged as `ccc.mlops` so
-`uv run python -m ...` works from any directory; SQL, scenario/model TOML and runbooks live
-under `mlops/`. See `mlops/README.md` for details.
+Databricks writes; no scheduled workflow yet). Python code is packaged as `ccc.mlops`, but the
+commands below must run from the repository root (or use
+`uv run --directory /path/to/repo python -m ...`), because the relative SQL and warehouse paths
+resolve from the working directory; SQL, scenario/model TOML and runbooks live under `mlops/`.
+See `mlops/README.md` for details.
 
 Run a versioned SQL check over a built DuckDB warehouse (a directory from
 `ccc.duck.build`, or a plain DuckDB file):

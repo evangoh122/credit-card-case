@@ -1,9 +1,22 @@
 """Deterministic seeds for scheduled MLOps runs."""
 
 import hashlib
-from datetime import date
+from datetime import date, datetime
 
 MAX_SEED = 2**63 - 1
+
+
+def validate_run_date(run_date: date) -> date:
+    """Return ``run_date`` after rejecting booleans and ``datetime`` instances.
+
+    ``datetime`` subclasses ``date``, so accepting it would let two times on one
+    calendar date derive different seeds and reserve different daily targets.
+    """
+    if isinstance(run_date, bool) or not isinstance(run_date, date):
+        raise TypeError("run_date must be a date")
+    if isinstance(run_date, datetime):
+        raise TypeError("run_date must be a date, not a datetime")
+    return run_date
 
 
 def derive_seed(run_date: date, root_seed: int) -> int:
@@ -12,8 +25,7 @@ def derive_seed(run_date: date, root_seed: int) -> int:
     Re-running the same ``run_date`` with the same ``root_seed`` always yields the
     same value, while a different date or root seed yields a different stream.
     """
-    if isinstance(run_date, bool) or not isinstance(run_date, date):
-        raise TypeError("run_date must be a date")
+    validate_run_date(run_date)
     if isinstance(root_seed, bool) or not isinstance(root_seed, int) or root_seed < 0:
         raise ValueError("root_seed must be a non-negative integer")
     payload = f"{run_date.isoformat()}|{root_seed}".encode()

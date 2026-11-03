@@ -7,24 +7,44 @@ from pathlib import Path
 import duckdb
 import polars as pl
 
+from ccc.gold import guard_no_truth_columns
 
-def run_sql(db: str | Path | duckdb.DuckDBPyConnection, sql_file: str | Path) -> pl.DataFrame:
+
+def _result(con: duckdb.DuckDBPyConnection, sql: str) -> pl.DataFrame:
+    """Run ``sql`` in UTC and return its result after the truth-column guard."""
+    con.execute("SET TimeZone = 'UTC'")
+    frame = con.sql(sql).pl()
+    guard_no_truth_columns(frame)
+    return frame
+
+
+def run_sql(
+    db: str | Path | duckdb.DuckDBPyConnection,
+    sql_file: str | Path,
+    *,
+    read_only: bool = True,
+) -> pl.DataFrame:
     """Execute a ``.sql`` file and return its final result as a Polars DataFrame.
 
     ``db`` may be an open DuckDB connection, a warehouse directory built by
-    :mod:`ccc.duck.build`, or a plain DuckDB database file.
+    :mod:`ccc.duck.build`, or a plain DuckDB database file. File databases are
+    opened read-only unless ``read_only`` is cleared, and a missing file is an
+    error instead of a newly created database. Results are checked with
+    :func:`ccc.gold.guard_no_truth_columns` before they are returned.
     """
     sql = Path(sql_file).read_text(encoding="utf-8")
     if isinstance(db, duckdb.DuckDBPyConnection):
-        return db.sql(sql).pl()
+        return _result(db, sql)
     path = Path(db)
     if path.is_dir():
         from ccc.duck import connect
 
         with connect(path) as con:
-            return con.sql(sql).pl()
-    with duckdb.connect(str(path)) as con:
-        return con.sql(sql).pl()
+            return _result(con, sql)
+    if not path.is_file():
+        raise FileNotFoundError(f"duckdb database file is missing: {path}")
+    with duckdb.connect(str(path), read_only=read_only) as con:
+        return _result(con, sql)
 
 
 def main(argv: list[str] | None = None) -> int:

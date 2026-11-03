@@ -64,3 +64,61 @@ def test_cli_prints_the_result(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "dim.dim_customer" in out
     assert "gold.fact_rfm_snapshot" in out
+
+
+def _write_sql(tmp_path: Path, name: str, body: str) -> Path:
+    path = tmp_path / name
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_run_sql_rejects_truth_columns_from_a_connection(memory_db, tmp_path):
+    sql = _write_sql(tmp_path, "truth.sql", "SELECT 1 AS sim_truth_risk;\n")
+    with pytest.raises(ValueError, match="sim_truth_risk"):
+        sql_runner.run_sql(memory_db, sql)
+
+
+def test_run_sql_rejects_truth_columns_from_a_file(tmp_path):
+    db = tmp_path / "warehouse.duckdb"
+    with duckdb.connect(str(db)) as con:
+        _seed_warehouse(con)
+    sql = _write_sql(tmp_path, "truth.sql", "SELECT 1 AS sim_truth_risk;\n")
+    with pytest.raises(ValueError, match="sim_truth_risk"):
+        sql_runner.run_sql(db, sql)
+
+
+def test_run_sql_rejects_truth_columns_from_a_warehouse_directory(tmp_path):
+    build = tmp_path / "build-1"
+    build.mkdir()
+    for name in ("hub", "dim", "facts", "gold"):
+        with duckdb.connect(str(build / f"{name}.duckdb")):
+            pass
+    (tmp_path / "current").symlink_to(build)
+    sql = _write_sql(tmp_path, "truth.sql", "SELECT 1 AS sim_truth_risk;\n")
+    with pytest.raises(ValueError, match="sim_truth_risk"):
+        sql_runner.run_sql(tmp_path, sql)
+
+
+def test_run_sql_does_not_create_a_missing_database_file(tmp_path):
+    db = tmp_path / "typo.duckdb"
+    with pytest.raises(FileNotFoundError, match="missing"):
+        sql_runner.run_sql(db, ROW_COUNTS)
+    assert not db.exists()
+
+
+def test_run_sql_opens_existing_files_read_only_by_default(tmp_path):
+    db = tmp_path / "warehouse.duckdb"
+    with duckdb.connect(str(db)) as con:
+        _seed_warehouse(con)
+    write = _write_sql(tmp_path, "write.sql", "INSERT INTO dim.dim_customer VALUES ('c3');\n")
+    with pytest.raises(duckdb.Error, match="read-only|read only"):
+        sql_runner.run_sql(db, write)
+    frame = sql_runner.run_sql(db, write, read_only=False)
+    assert frame["Count"].to_list() == [1]
+
+
+def test_run_sql_sets_the_utc_session_timezone(memory_db, tmp_path):
+    sql = _write_sql(tmp_path, "tz.sql", "SELECT current_setting('TimeZone') AS tz;\n")
+    memory_db.execute("SET TimeZone = 'America/Los_Angeles'")
+    frame = sql_runner.run_sql(memory_db, sql)
+    assert frame["tz"].to_list() == ["UTC"]

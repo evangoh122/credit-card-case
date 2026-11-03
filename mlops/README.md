@@ -2,8 +2,10 @@
 
 Minimal, versioned MLOps scaffolding for the case. It contains no data, no heavy
 model logic, no network access and no remote writes. Python code lives in the
-installed package (`src/ccc/mlops/`) so `uv run python -m ...` works from any
-directory; SQL, configs and runbooks stay under `mlops/`.
+installed package (`src/ccc/mlops/`), but run every command below from the
+repository root (or use `uv run --directory /path/to/repo python -m ...`), since
+the SQL and warehouse paths are relative; SQL, configs and runbooks stay under
+`mlops/`.
 
 ## Layout
 

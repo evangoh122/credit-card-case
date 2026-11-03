@@ -3,13 +3,15 @@
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 from datetime import date
 from pathlib import Path
 
 import mlflow
 
-from ccc.mlops.seed import derive_seed
+from ccc.mlops.seed import derive_seed, validate_run_date
 
 EXPERIMENT = "ccc-mlops-daily"
 DEFAULT_TARGET_DIR = Path("data/mlops_daily")
@@ -37,6 +39,31 @@ def _experiment_id(experiment: str, tracking_dir: Path) -> str:
     )
 
 
+def _publish_marker(target: Path, marker: dict[str, str | int]) -> None:
+    """Publish ``run.json`` inside ``target`` atomically and without clobbering.
+
+    The marker is written to a staging directory first, so a crash before
+    publication never reserves the daily target. Publication is a single rename,
+    and an existing target is refused.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
+    try:
+        (staging / "run.json").write_text(
+            json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        ensure_append_only(target)
+        try:
+            os.rename(staging, target)
+        except OSError as exc:
+            if target.exists() or target.is_symlink():
+                raise AppendOnlyError(f"append-only target already exists: {target}") from exc
+            raise
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
 def run_daily(
     run_date: date,
     seed: int,
@@ -47,9 +74,12 @@ def run_daily(
 ) -> dict[str, str | int]:
     """Log one daily run to a single local-file MLflow experiment.
 
-    The target directory is checked before anything is written and refuses to
-    overwrite an existing run, so the pipeline stays append-only.
+    The run date is validated and the target directory is checked before
+    anything is written; an existing run is never overwritten, so the pipeline
+    stays append-only. The ``run.json`` marker is prepared before the target is
+    published, so an interrupted attempt never reserves the date.
     """
+    run_date = validate_run_date(run_date)
     target = ensure_append_only(Path(target_dir) / run_date.isoformat())
     derived_seed = derive_seed(run_date, seed)
     tracking_root = Path(tracking_dir).resolve()
@@ -70,14 +100,7 @@ def run_daily(
             }
         )
         mlflow.set_tag("data_label", "synthetic")
-        target.mkdir(parents=True)
-        (target / "run.json").write_text(
-            json.dumps(
-                {"run_date": run_date.isoformat(), "derived_seed": derived_seed},
-                sort_keys=True,
-            )
-            + "\n"
-        )
+        _publish_marker(target, {"run_date": run_date.isoformat(), "derived_seed": derived_seed})
         return {
             "run_id": run.info.run_id,
             "experiment_id": experiment_id,
