@@ -54,6 +54,27 @@ uv run ruff check . && uv run ruff format --check .
   until the Evidently `Report.run` boundary. Dependencies are locked by `uv lock`; check with
   `uv lock --check`.
 
+## MLOps skeleton
+
+`mlops/` holds a minimal, append-only MLOps skeleton (no data, network, Hugging Face or
+Databricks writes; no scheduled workflow yet). Python code is packaged as `ccc.mlops`, but the
+commands below must run from the repository root (or use
+`uv run --directory /path/to/repo python -m ...`), because the relative SQL and warehouse paths
+resolve from the working directory; SQL, scenario/model TOML and runbooks live under `mlops/`.
+See `mlops/README.md` for details.
+
+Run a versioned SQL check over a built DuckDB warehouse (a directory from
+`ccc.duck.build`, or a plain DuckDB file):
+
+```bash
+uv run python -m ccc.mlops.sql_runner --db data/warehouse --sql mlops/sql/001_row_counts.sql
+```
+
+The runner returns a Polars `DataFrame`. The daily stub
+`uv run python -m ccc.mlops.daily --run-date 2026-11-03 --seed 7` derives a deterministic
+seed, refuses an existing target path, and logs parameters to one local-file MLflow
+experiment; it never writes to a remote store.
+
 ## Layout: `original/` vs `src/ccc`
 
 - `src/ccc` (this package, Python 3.12) is the seeded simulator described above.
