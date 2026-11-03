@@ -1,8 +1,9 @@
+import ctypes
+import errno
 import json
 import multiprocessing as mp
 import os
 import socket
-import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -132,93 +133,118 @@ def test_empty_target_created_after_check_is_refused(tmp_path, monkeypatch):
     assert [p.name for p in tmp_path.iterdir()] == ["2026-11-03"]
 
 
-def _publisher_after_synchronized_check(target, barrier, queue, seed):
-    original = daily.ensure_append_only
-
-    def synchronized(path):
-        result = original(path)
-        barrier.wait(timeout=20)
-        return result
-
-    daily.ensure_append_only = synchronized
+def _public_publisher(target_dir, tracking_dir, seed, barrier, queue):
     try:
-        daily._publish_marker(Path(target), {"derived_seed": seed})
-        queue.put(("ok", seed))
+        barrier.wait(timeout=20)
+        result = daily.run_daily(
+            date(2026, 11, 3), seed, target_dir=target_dir, tracking_dir=tracking_dir
+        )
+        queue.put(("ok", seed, result["derived_seed"]))
     except daily.AppendOnlyError:
-        queue.put(("exists", seed))
+        queue.put(("exists", seed, None))
     except BaseException as exc:  # pragma: no cover - surfaced through the queue
-        queue.put((type(exc).__name__, seed))
+        queue.put((type(exc).__name__, seed, str(exc)))
 
 
-def test_concurrent_publishers_produce_exactly_one_complete_winner(tmp_path):
+def test_concurrent_public_publishers_produce_exactly_one_winner(tmp_path):
     ctx = mp.get_context("fork")
     barrier = ctx.Barrier(2)
     queue = ctx.Queue()
-    target = tmp_path / "2026-11-03"
+    targets = tmp_path / "targets"
     workers = [
         ctx.Process(
-            target=_publisher_after_synchronized_check,
-            args=(str(target), barrier, queue, seed),
+            target=_public_publisher,
+            args=(str(targets), str(tmp_path / f"mlruns-{seed}"), seed, barrier, queue),
         )
         for seed in (1, 2)
     ]
     for worker in workers:
         worker.start()
     for worker in workers:
-        worker.join(20)
+        worker.join(30)
         if worker.is_alive():
             worker.kill()
             worker.join()
         assert worker.exitcode == 0
-    results = [queue.get(timeout=5) for _ in workers]
-    assert sorted(status for status, _ in results) == ["exists", "ok"]
-    winner = next(seed for status, seed in results if status == "ok")
-    assert json.loads((target / "run.json").read_text()) == {"derived_seed": winner}
-    assert [p.name for p in tmp_path.iterdir()] == ["2026-11-03"]
+    results = [queue.get(timeout=10) for _ in workers]
+    assert sorted(status for status, _, _ in results) == ["exists", "ok"]
+    winner = next((seed, derived) for status, seed, derived in results if status == "ok")
+    marker = json.loads((targets / "2026-11-03" / "run.json").read_text())
+    assert marker == {"run_date": "2026-11-03", "derived_seed": winner[1]}
+    assert [p.name for p in targets.iterdir()] == ["2026-11-03"]
 
 
-def _crash_before_publication(target):
-    daily._rename_noreplace = lambda *args: os._exit(77)
-    daily._publish_marker(Path(target), {"derived_seed": 1})
+def _crash_in_publication(target_dir, tracking_dir):
+    from ccc.mlops import daily as child_daily
+
+    if hasattr(child_daily, "_load_renameat2"):
+        child_daily._rename_noreplace = lambda *args, **kwargs: os._exit(77)
+    else:
+        child_daily._rename_noreplace_at2 = lambda *args, **kwargs: False
+        os.rename = lambda *args, **kwargs: os._exit(77)
+    child_daily.run_daily(date(2026, 11, 3), 7, target_dir=target_dir, tracking_dir=tracking_dir)
 
 
-def test_crash_before_publication_does_not_reserve_the_date(tmp_path):
-    target = tmp_path / "2026-11-03"
-    worker = mp.get_context("fork").Process(target=_crash_before_publication, args=(str(target),))
+def test_crash_between_staging_and_rename_leaves_the_date_retryable(tmp_path):
+    targets = tmp_path / "targets"
+    tracking = tmp_path / "mlruns"
+    worker = mp.get_context("fork").Process(
+        target=_crash_in_publication, args=(str(targets), str(tracking))
+    )
     worker.start()
-    worker.join(20)
+    worker.join(30)
     if worker.is_alive():
         worker.kill()
         worker.join()
     assert worker.exitcode == 77
+    target = targets / "2026-11-03"
     assert not target.exists()
-    daily._publish_marker(target, {"derived_seed": 2})
-    assert json.loads((target / "run.json").read_text()) == {"derived_seed": 2}
-    with pytest.raises(daily.AppendOnlyError, match="already exists"):
-        daily._publish_marker(target, {"derived_seed": 3})
-    assert json.loads((target / "run.json").read_text()) == {"derived_seed": 2}
+    result = daily.run_daily(date(2026, 11, 3), 7, target_dir=targets, tracking_dir=tracking)
+    assert result["target"] == str(target)
+    assert json.loads((target / "run.json").read_text()) == {
+        "run_date": "2026-11-03",
+        "derived_seed": result["derived_seed"],
+    }
 
 
-def test_portable_fallback_refuses_an_existing_empty_target(tmp_path, monkeypatch):
-    monkeypatch.setattr(daily, "_rename_noreplace_at2", lambda *args: False)
-    target = tmp_path / "2026-11-03"
-    target.mkdir()
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "run.json").write_text("{}\n", encoding="utf-8")
-    with pytest.raises(daily.AppendOnlyError, match="already exists"):
-        daily._rename_noreplace(staging, target)
-    assert list(target.iterdir()) == []
+class _FakeRenameat2:
+    argtypes = None
+    restype = None
+
+    def __init__(self, code):
+        self.code = code
+
+    def __call__(self, *args):
+        ctypes.set_errno(self.code)
+        return -1
 
 
-def test_portable_fallback_reclaims_a_stale_empty_reservation(tmp_path, monkeypatch):
-    monkeypatch.setattr(daily, "_rename_noreplace_at2", lambda *args: False)
-    target = tmp_path / "2026-11-03"
-    target.mkdir()
-    stale = time.time() - daily._INCOMPLETE_RESERVATION_SECONDS - 1
-    os.utime(target, (stale, stale))
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "run.json").write_text("{}\n", encoding="utf-8")
-    daily._rename_noreplace(staging, target)
-    assert (target / "run.json").read_text(encoding="utf-8") == "{}\n"
+class _FakeLibc:
+    def __init__(self, code):
+        self.renameat2 = _FakeRenameat2(code)
+
+
+def test_missing_renameat2_raises_before_creating_anything(tmp_path, monkeypatch):
+    def missing_libc(*args, **kwargs):
+        raise OSError("libc unavailable")
+
+    monkeypatch.setattr(daily.ctypes, "CDLL", missing_libc)
+    targets = tmp_path / "targets"
+    tracking = tmp_path / "mlruns"
+    with pytest.raises(RuntimeError, match="renameat2") as excinfo:
+        daily.run_daily(date(2026, 11, 3), 7, target_dir=targets, tracking_dir=tracking)
+    assert type(excinfo.value).__name__ == "UnsupportedPlatformError"
+    assert not targets.exists()
+    assert not tracking.exists()
+
+
+@pytest.mark.parametrize("code", [errno.ENOSYS, errno.EINVAL])
+def test_unavailable_renameat2_raises_before_creating_anything(tmp_path, monkeypatch, code):
+    monkeypatch.setattr(daily.ctypes, "CDLL", lambda *args, **kwargs: _FakeLibc(code))
+    targets = tmp_path / "targets"
+    tracking = tmp_path / "mlruns"
+    with pytest.raises(RuntimeError, match="renameat2") as excinfo:
+        daily.run_daily(date(2026, 11, 3), 7, target_dir=targets, tracking_dir=tracking)
+    assert type(excinfo.value).__name__ == "UnsupportedPlatformError"
+    assert not targets.exists()
+    assert not tracking.exists()

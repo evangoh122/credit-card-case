@@ -46,6 +46,14 @@ uv run python -m ccc.mlops.daily \
 - Derives a deterministic per-date seed from `(run_date, seed)`.
 - Refuses to continue when the target path already exists (append-only); it
   never overwrites a previous run.
+- Publishes the run by moving a complete staging directory into place with
+  `renameat2(RENAME_NOREPLACE)`. Daily runs therefore require Linux (CI is
+  Ubuntu). If the syscall, the libc symbol or the flag is unavailable
+  (non-Linux, missing symbol, `ENOSYS`/`EINVAL`), `run_daily` raises
+  `ccc.mlops.daily.UnsupportedPlatformError` before creating the target, so
+  nothing is left behind. There is no portable fallback path.
+- A crash before publication leaves only an ignored `.<date>.staging-*` directory
+  inside the target parent; the date itself is never reserved and can be retried.
 - Logs parameters to one local-file MLflow experiment (`ccc-mlops-daily`).
   The tracking URI is a `file://` store; nothing is sent to a server.
 - Does no ingestion, training or data writes beyond a small `run.json` marker.
