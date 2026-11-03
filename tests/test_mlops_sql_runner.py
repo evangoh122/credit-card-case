@@ -122,3 +122,47 @@ def test_run_sql_sets_the_utc_session_timezone(memory_db, tmp_path):
     memory_db.execute("SET TimeZone = 'America/Los_Angeles'")
     frame = sql_runner.run_sql(memory_db, sql)
     assert frame["tz"].to_list() == ["UTC"]
+
+
+NAIVE_TIMESTAMP_SQL = "SELECT TIMESTAMP '2026-11-03 12:00:00' AS event_ts_utc;\n"
+
+
+def test_run_sql_rejects_naive_timestamps_from_a_connection(tmp_path):
+    sql = _write_sql(tmp_path, "naive.sql", NAIVE_TIMESTAMP_SQL)
+    with duckdb.connect(":memory:") as con:
+        with pytest.raises(ValueError, match="naive|timestamp|UTC"):
+            sql_runner.run_sql(con, sql)
+
+
+def test_run_sql_rejects_naive_timestamps_from_a_file(tmp_path):
+    db = tmp_path / "warehouse.duckdb"
+    duckdb.connect(str(db)).close()
+    sql = _write_sql(tmp_path, "naive.sql", NAIVE_TIMESTAMP_SQL)
+    with pytest.raises(ValueError, match="naive|timestamp|UTC"):
+        sql_runner.run_sql(db, sql)
+
+
+def test_run_sql_rejects_naive_timestamps_from_a_warehouse_directory(tmp_path):
+    build = tmp_path / "build-1"
+    build.mkdir()
+    for name in ("hub", "dim", "facts", "gold"):
+        duckdb.connect(str(build / f"{name}.duckdb")).close()
+    (tmp_path / "current").symlink_to(build)
+    sql = _write_sql(tmp_path, "naive.sql", NAIVE_TIMESTAMP_SQL)
+    with pytest.raises(ValueError, match="naive|timestamp|UTC"):
+        sql_runner.run_sql(tmp_path, sql)
+
+
+def test_run_sql_returns_aware_utc_timestamps_and_keeps_dates(memory_db, tmp_path):
+    sql = _write_sql(
+        tmp_path,
+        "aware.sql",
+        "SELECT TIMESTAMPTZ '2026-11-03 00:30:00+00' AS ts, "
+        "CAST(TIMESTAMPTZ '2026-11-03 00:30:00+00' AS DATE) AS day;\n",
+    )
+    memory_db.execute("SET TimeZone = 'America/Los_Angeles'")
+    frame = sql_runner.run_sql(memory_db, sql)
+    assert frame.schema["ts"].time_zone == "UTC"
+    assert frame.schema["day"] == pl.Date
+    assert frame["ts"].to_list()[0].isoformat() == "2026-11-03T00:30:00+00:00"
+    assert str(frame["day"][0]) == "2026-11-03"

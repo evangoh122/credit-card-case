@@ -10,10 +10,34 @@ import polars as pl
 from ccc.gold import guard_no_truth_columns
 
 
+def _guard_utc_timestamps(frame: pl.DataFrame) -> None:
+    """Reject timestamp columns that are not timezone-aware UTC.
+
+    DuckDB returns ``TIMESTAMPTZ`` in the session timezone, which ``_result``
+    pins to UTC, but a bare ``TIMESTAMP`` stays naive and would silently mix
+    with aware warehouse columns. Naive (or non-UTC) results are an error.
+    """
+    naive = sorted(
+        name
+        for name, dtype in frame.schema.items()
+        if isinstance(dtype, pl.Datetime) and dtype.time_zone is None
+    )
+    non_utc = sorted(
+        name
+        for name, dtype in frame.schema.items()
+        if isinstance(dtype, pl.Datetime) and dtype.time_zone not in (None, "UTC")
+    )
+    if naive or non_utc:
+        raise ValueError(
+            f"SQL timestamp columns must be timezone-aware UTC; naive: {naive}, non-UTC: {non_utc}"
+        )
+
+
 def _result(con: duckdb.DuckDBPyConnection, sql: str) -> pl.DataFrame:
-    """Run ``sql`` in UTC and return its result after the truth-column guard."""
+    """Run ``sql`` in UTC and return its result after dtype and truth guards."""
     con.execute("SET TimeZone = 'UTC'")
     frame = con.sql(sql).pl()
+    _guard_utc_timestamps(frame)
     guard_no_truth_columns(frame)
     return frame
 
@@ -29,8 +53,9 @@ def run_sql(
     ``db`` may be an open DuckDB connection, a warehouse directory built by
     :mod:`ccc.duck.build`, or a plain DuckDB database file. File databases are
     opened read-only unless ``read_only`` is cleared, and a missing file is an
-    error instead of a newly created database. Results are checked with
-    :func:`ccc.gold.guard_no_truth_columns` before they are returned.
+    error instead of a newly created database. Every branch runs in UTC and
+    rejects naive or non-UTC timestamp columns, then applies
+    :func:`ccc.gold.guard_no_truth_columns` before returning.
     """
     sql = Path(sql_file).read_text(encoding="utf-8")
     if isinstance(db, duckdb.DuckDBPyConnection):
