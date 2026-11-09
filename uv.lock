@@ -209,7 +209,7 @@ requires-dist = [
     { name = "polars" },
     { name = "scikit-learn" },
     { name = "scipy" },
-    { name = "sdv", specifier = ">=2.0.0" },
+    { name = "sdv", specifier = ">=2.1.0" },
 ]
 provides-extras = ["hf"]
 
@@ -2328,7 +2328,7 @@ wheels = [
 
 [[package]]
 name = "sdv"
-version = "2.0.0"
+version = "2.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -2346,9 +2346,9 @@ dependencies = [
     { name = "sdmetrics" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5d/e0/9db7b0ffb060c3e0589863fc807f94f61f490042952ecf8f8f25c63b0d2e/sdv-2.0.0.tar.gz", hash = "sha256:cb7ed2c1e1ef5612ed68d6f8b90d546d9c8963659cd5072b4f3a79c30d496812", size = 169329, upload-time = "2026-10-15T21:00:24.147Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/bb/d195ad80688e1133f6ba262a31d7ed0c6fcbb7c5e41efae05fee689de91d/sdv-2.1.0.tar.gz", hash = "sha256:202fdc70630bb838d8a3686bc3bb4961ccbd6313024acdfb4ba40da0222c41ff", size = 169229, upload-time = "2026-10-30T19:40:24.709Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0f/06/0d16b8a9dd2552c732cb1bd08b9eb41ee242879f6af2d4e19fbaa940d4fc/sdv-2.0.0-py3-none-any.whl", hash = "sha256:81bc093c7e003c9bcc1537a461fec9073e822fcec202087534d28b9f7293a6d6", size = 192532, upload-time = "2026-10-15T21:00:21.952Z" },
+    { url = "https://files.pythonhosted.org/packages/80/d8/2e1f3639cf986926686a7bc685a634a516c9dee4c2a14c9401fca4e48797/sdv-2.1.0-py3-none-any.whl", hash = "sha256:c632c64c8352cc7bd4d595fe15671da30cee8e32f74b9499a5ac828d6f718be2", size = 192508, upload-time = "2026-10-30T19:40:22.752Z" },
 ]
 
 [[package]]
